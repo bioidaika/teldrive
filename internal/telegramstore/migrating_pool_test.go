@@ -281,7 +281,7 @@ func TestShieldedDCPoolDetachesCancelAndAbortsQueuedWaiters(t *testing.T) {
 		}
 		return nil
 	}}
-	pool := newShieldedDCPool(inner)
+	pool := newShieldedDCPool(inner, 1)
 	defer pool.Close()
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
@@ -308,5 +308,178 @@ func TestShieldedDCPoolDetachesCancelAndAbortsQueuedWaiters(t *testing.T) {
 	}
 	if got := innerCalls.Load(); got != 1 {
 		t.Fatalf("innerCalls = %d, want 1", got)
+	}
+}
+
+func TestShieldedDCPoolRunsConfiguredConcurrency(t *testing.T) {
+	const parallel = 4
+	allStarted := make(chan struct{})
+	release := make(chan struct{})
+	var active atomic.Int32
+
+	inner := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, _ bin.Decoder) error {
+		if active.Add(1) == parallel {
+			close(allStarted)
+		}
+		<-release
+		return nil
+	}}
+	pool := newShieldedDCPool(inner, parallel)
+	defer pool.Close()
+
+	var wg sync.WaitGroup
+	for range parallel {
+		wg.Go(func() {
+			if err := pool.Invoke(context.Background(), nil, nil); err != nil {
+				t.Errorf("Invoke() = %v", err)
+			}
+		})
+	}
+	<-allStarted
+
+	ctxExtra, cancelExtra := context.WithCancel(context.Background())
+	cancelExtra()
+	if err := pool.Invoke(ctxExtra, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fifth caller while full = %v, want context.Canceled", err)
+	}
+
+	close(release)
+	wg.Wait()
+}
+
+func TestMigratingPoolRoutesHintedCrossDCDocumentWithoutProbingHome(t *testing.T) {
+	var homeCalls, opens, targetCalls atomic.Int32
+	home := &testDCPool{InvokeFunc: func(_ context.Context, input bin.Encoder, _ bin.Decoder) error {
+		homeCalls.Add(1)
+		if _, ok := input.(*tg.UploadGetFileRequest); ok {
+			return tgerr.New(-503, "Timeout")
+		}
+		return nil
+	}}
+	target := &testDCPool{InvokeFunc: func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+		targetCalls.Add(1)
+		req := input.(*tg.UploadGetFileRequest)
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{byte(req.Offset)}}
+		return nil
+	}}
+	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		if dc != 4 {
+			return nil, fmt.Errorf("unexpected target DC %d", dc)
+		}
+		opens.Add(1)
+		return target, nil
+	}, unwrappedPool)
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	// Non-upload.getFile RPCs must stay on the home DC even if a DC hint is attached.
+	if err := router.Invoke(withDocumentDC(context.Background(), 4), &tg.ChannelsGetMessagesRequest{}, nil); err != nil {
+		t.Fatalf("metadata Invoke() = %v", err)
+	}
+	if got := homeCalls.Load(); got != 1 {
+		t.Fatalf("metadata homeCalls = %d, want 1", got)
+	}
+
+	loc := &tg.InputDocumentFileLocation{
+		ID:            777,
+		AccessHash:    999,
+		FileReference: []byte{1, 2, 3},
+	}
+	var wg sync.WaitGroup
+	for n := range 8 {
+		wg.Go(func() {
+			var out tg.UploadFileBox
+			ctx := withDocumentDC(context.Background(), 4)
+			if err := router.Invoke(ctx, &tg.UploadGetFileRequest{Location: loc, Offset: int64(n)}, &out); err != nil {
+				t.Errorf("Invoke(%d) = %v", n, err)
+				return
+			}
+			if got := out.File.(*tg.UploadFile).Bytes; len(got) != 1 || got[0] != byte(n) {
+				t.Errorf("chunk %d = %v", n, got)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := homeCalls.Load(); got != 1 {
+		t.Fatalf("homeCalls after cross-DC reads = %d, want 1 (no home UploadGetFile probe)", got)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("target opens = %d, want 1", got)
+	}
+	if got := targetCalls.Load(); got != 8 {
+		t.Fatalf("targetCalls = %d, want 8", got)
+	}
+}
+
+func TestMigratingPoolUsesHomeDirectlyWhenDocumentHintMatchesHomeDC(t *testing.T) {
+	var homeCalls atomic.Int32
+	home := &testDCPool{InvokeFunc: func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+		homeCalls.Add(1)
+		req := input.(*tg.UploadGetFileRequest)
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{byte(req.Offset)}}
+		return nil
+	}}
+	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		t.Fatalf("unexpected sub-DC open for home DC %d", dc)
+		return nil, nil
+	}, unwrappedPool)
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{ID: 888, AccessHash: 111, FileReference: []byte{9}}
+	var wg sync.WaitGroup
+	for n := range 4 {
+		wg.Go(func() {
+			var out tg.UploadFileBox
+			if err := router.Invoke(withDocumentDC(context.Background(), 5), &tg.UploadGetFileRequest{Location: loc, Offset: int64(n)}, &out); err != nil {
+				t.Errorf("Invoke(%d) = %v", n, err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := homeCalls.Load(); got != 4 {
+		t.Fatalf("homeCalls = %d, want 4", got)
+	}
+}
+
+func TestMigratingPoolReroutesStaleDocumentDCHint(t *testing.T) {
+	var dc2Calls, dc4Calls atomic.Int32
+	home := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		t.Fatal("unexpected home call")
+		return nil
+	}}
+	dc2 := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		dc2Calls.Add(1)
+		return tgerr.New(303, "FILE_MIGRATE_4")
+	}}
+	dc4 := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, output bin.Decoder) error {
+		dc4Calls.Add(1)
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{4}}
+		return nil
+	}}
+	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		switch dc {
+		case 2:
+			return dc2, nil
+		case 4:
+			return dc4, nil
+		default:
+			return nil, fmt.Errorf("unexpected DC %d", dc)
+		}
+	}, unwrappedPool)
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{ID: 555, AccessHash: 222, FileReference: []byte{7}}
+	for range 2 {
+		var out tg.UploadFileBox
+		if err := router.Invoke(withDocumentDC(context.Background(), 2), &tg.UploadGetFileRequest{Location: loc}, &out); err != nil {
+			t.Fatalf("Invoke() = %v", err)
+		}
+	}
+	if dc2Calls.Load() != 1 || dc4Calls.Load() != 2 {
+		t.Fatalf("dc2Calls=%d dc4Calls=%d, want 1 and 2", dc2Calls.Load(), dc4Calls.Load())
 	}
 }

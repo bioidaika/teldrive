@@ -21,13 +21,29 @@ type dcPoolEntry struct {
 	err   error
 }
 
+type documentDCContextKey struct{}
+
+func withDocumentDC(ctx context.Context, dc int) context.Context {
+	if dc <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, documentDCContextKey{}, dc)
+}
+
+func documentDC(ctx context.Context) (int, bool) {
+	dc, ok := ctx.Value(documentDCContextKey{}).(int)
+	return dc, ok && dc > 0
+}
+
 // migratingPool mirrors gotd's invokeDirect/invokeSub handling for file and
 // stats redirects without migrating the primary session. Unlike invokeSub's
 // single-connection pool, target pools retain the configured connection count.
-// Each request starts on the home DC: different files may live on different DCs.
+// Each request starts on the home DC unless a document DC hint routes an
+// upload.getFile call directly to a non-home target DC.
 type migratingPool struct {
 	home     telegram.CloseInvoker
 	api      tg.Invoker
+	homeDC   func() int
 	openHome func() (telegram.CloseInvoker, error)
 	open     func(context.Context, int) (telegram.CloseInvoker, error)
 	wrap     func(tg.Invoker) tg.Invoker
@@ -50,6 +66,18 @@ func newMigratingPool(home telegram.CloseInvoker, open func(context.Context, int
 	}
 }
 
+func (p *migratingPool) currentHomeDC() int {
+	if p.homeDC == nil {
+		return 0
+	}
+	return p.homeDC()
+}
+
+func isUploadGetFileRequest(input bin.Encoder) bool {
+	req, ok := input.(*tg.UploadGetFileRequest)
+	return ok && req != nil
+}
+
 func cacheableDocumentID(input bin.Encoder) (int64, bool) {
 	req, ok := input.(*tg.UploadGetFileRequest)
 	if !ok || req == nil {
@@ -64,6 +92,10 @@ func cacheableDocumentID(input bin.Encoder) (int64, bool) {
 
 func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	docID, cacheable := cacheableDocumentID(input)
+	hintDC, hasHint := 0, false
+	if isUploadGetFileRequest(input) {
+		hintDC, hasHint = documentDC(ctx)
+	}
 	var ownProbe chan struct{}
 
 	for {
@@ -80,6 +112,18 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 				}
 				break
 			}
+		}
+		if hasHint {
+			homeDC := p.currentHomeDC()
+			if homeDC <= 0 || hintDC != homeDC {
+				p.mu.Unlock()
+				return p.invokeHintedSub(ctx, docID, cacheable, hintDC, input, output)
+			}
+			// Document metadata already points to the home DC, so parallel chunk
+			// reads can proceed immediately without serializing on a probe.
+			break
+		}
+		if cacheable {
 			if waitCh, ok := p.probing[docID]; ok {
 				p.mu.Unlock()
 				select {
@@ -100,6 +144,9 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 
 	finishProbe := func(dc int, ok bool) {
 		if ownProbe == nil {
+			if ok && cacheable {
+				p.recordFileDC(docID, dc)
+			}
 			return
 		}
 		p.mu.Lock()
@@ -129,6 +176,55 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 	}
 	finishProbe(rpcErr.Argument, true)
 	return p.invokeSub(ctx, rpcErr.Argument, input, output)
+}
+
+func (p *migratingPool) recordFileDC(docID int64, dc int) {
+	p.mu.Lock()
+	if !p.closed {
+		p.fileDCs[docID] = dc
+	}
+	p.mu.Unlock()
+}
+
+func (p *migratingPool) invokeHintedSub(ctx context.Context, docID int64, cacheable bool, dc int, input bin.Encoder, output bin.Decoder) error {
+	err := p.invokeSub(ctx, dc, input, output)
+	if err == nil {
+		if cacheable {
+			p.recordFileDC(docID, dc)
+		}
+		return nil
+	}
+	rpcErr, ok := tgerr.As(err)
+	if !ok || !rpcErr.IsOneOf("FILE_MIGRATE", "STATS_MIGRATE") || rpcErr.Argument <= 0 || rpcErr.Argument == dc {
+		return err
+	}
+	targetDC := rpcErr.Argument
+	if homeDC := p.currentHomeDC(); homeDC > 0 && targetDC == homeDC {
+		if cacheable {
+			p.recordFileDC(docID, 0)
+		}
+		return p.invokeHomeOnly(ctx, input, output)
+	}
+	if cacheable {
+		p.recordFileDC(docID, targetDC)
+	}
+	return p.invokeSub(ctx, targetDC, input, output)
+}
+
+func (p *migratingPool) invokeHomeOnly(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errMigratingPoolClosed
+	}
+	home := p.home
+	api := p.api
+	p.mu.Unlock()
+	err := api.Invoke(ctx, input, output)
+	if errors.Is(err, context.DeadlineExceeded) {
+		p.resetHome(home)
+	}
+	return err
 }
 
 func (p *migratingPool) invokeSub(ctx context.Context, dc int, input bin.Encoder, output bin.Decoder) error {

@@ -1,12 +1,16 @@
 package telegramstore
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
@@ -282,4 +286,112 @@ func (i *rpcTimeoutThenSuccessDownloadInvoker) Invoke(_ context.Context, input b
 	box := output.(*tg.UploadFileBox)
 	box.File = &tg.UploadFile{Bytes: make([]byte, request.Limit)}
 	return nil
+}
+
+func encodeTLResponse(response bin.Encoder, output bin.Decoder) error {
+	buf := new(bin.Buffer)
+	if err := response.Encode(buf); err != nil {
+		return err
+	}
+	return output.Decode(buf)
+}
+
+func TestGotdDownloadSessionOpenRangePropagatesDocumentDCAndClientID(t *testing.T) {
+	const (
+		wantClientID int64 = 777001
+		channelID    int64 = 12345
+		messageID    int64 = 67
+		docID        int64 = 9001
+	)
+	wantPayload := bytes.Repeat([]byte("teldrive"), 1024) // 8192 bytes
+
+	var homeUploadCalls, targetUploadCalls atomic.Int32
+	home := &testDCPool{InvokeFunc: func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		if gotID, ok := ClientID(ctx); !ok || gotID != wantClientID {
+			return fmt.Errorf("home RPC %T got client_id=%d (ok=%v), want %d", input, gotID, ok, wantClientID)
+		}
+		switch input.(type) {
+		case *tg.ChannelsGetChannelsRequest:
+			return encodeTLResponse(&tg.MessagesChats{
+				Chats: []tg.ChatClass{&tg.Channel{ID: channelID, AccessHash: 555, Broadcast: true}},
+			}, output)
+		case *tg.ChannelsGetMessagesRequest:
+			return encodeTLResponse(&tg.MessagesChannelMessages{
+				Messages: []tg.MessageClass{&tg.Message{
+					ID: int(messageID),
+					Media: &tg.MessageMediaDocument{
+						Document: &tg.Document{
+							ID:            docID,
+							AccessHash:    888,
+							FileReference: []byte{1, 2, 3, 4},
+							Size:          int64(len(wantPayload)),
+							DCID:          4,
+						},
+					},
+				}},
+			}, output)
+		case *tg.UploadGetFileRequest:
+			homeUploadCalls.Add(1)
+			return tgerr.New(-503, "Timeout")
+		default:
+			return fmt.Errorf("unexpected home RPC %T", input)
+		}
+	}}
+	target := &testDCPool{InvokeFunc: func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		if gotID, ok := ClientID(ctx); !ok || gotID != wantClientID {
+			return fmt.Errorf("target RPC %T got client_id=%d (ok=%v), want %d", input, gotID, ok, wantClientID)
+		}
+		req, ok := input.(*tg.UploadGetFileRequest)
+		if !ok {
+			return fmt.Errorf("unexpected target RPC %T", input)
+		}
+		targetUploadCalls.Add(1)
+		end := min(req.Offset+int64(req.Limit), int64(len(wantPayload)))
+		return encodeTLResponse(&tg.UploadFile{
+			Type:  &tg.StorageFilePartial{},
+			Bytes: wantPayload[req.Offset:end],
+		}, output)
+	}}
+	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		if dc != 4 {
+			return nil, fmt.Errorf("unexpected target DC %d", dc)
+		}
+		return target, nil
+	}, unwrappedPool)
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	api := tg.NewClient(router)
+	session := &gotdDownloadSession{
+		clientID:             wantClientID,
+		clientFn:             func() (*tg.Client, error) { return api, nil },
+		closeFn:              func() error { return nil },
+		downloadReadBuffers:  4,
+		downloadReadParallel: 4,
+	}
+
+	rc, err := session.OpenRange(context.Background(), RangeRequest{
+		UserID:    1,
+		ChannelID: channelID,
+		MessageID: messageID,
+		Offset:    0,
+		Length:    int64(len(wantPayload)),
+	})
+	if err != nil {
+		t.Fatalf("OpenRange() = %v", err)
+	}
+	got, readErr := io.ReadAll(rc)
+	_ = rc.Close()
+	if readErr != nil {
+		t.Fatalf("ReadAll() = %v", readErr)
+	}
+	if !bytes.Equal(got, wantPayload) {
+		t.Fatalf("ReadAll() length = %d, want %d", len(got), len(wantPayload))
+	}
+	if homeUploadCalls.Load() != 0 {
+		t.Fatalf("homeUploadCalls = %d, want 0", homeUploadCalls.Load())
+	}
+	if targetUploadCalls.Load() == 0 {
+		t.Fatal("expected target DC UploadGetFile calls")
+	}
 }

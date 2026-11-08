@@ -113,8 +113,13 @@ func TestFactoryRateLimitsEachTelegramAccountSeparately(t *testing.T) {
 
 type recordingDCPoolClient struct {
 	home     telegram.CloseInvoker
+	homeDC   int
 	poolSize int64
 	openDC   func(context.Context, int, int64) (telegram.CloseInvoker, error)
+}
+
+func (c *recordingDCPoolClient) HomeDC() int {
+	return c.homeDC
 }
 
 func (c *recordingDCPoolClient) Pool(size int64) (telegram.CloseInvoker, error) {
@@ -124,6 +129,23 @@ func (c *recordingDCPoolClient) Pool(size int64) (telegram.CloseInvoker, error) 
 
 func (c *recordingDCPoolClient) DC(ctx context.Context, dc int, size int64) (telegram.CloseInvoker, error) {
 	return c.openDC(ctx, dc, size)
+}
+
+func TestFactoryPooledAPIValidation(t *testing.T) {
+	t.Parallel()
+	factory, err := NewFactory(FactoryConfig{AppID: 1, AppHash: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := factory.NewForAccount(new(session.StorageMemory), 42, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{0, -1} {
+		if _, _, err := factory.PooledAPI(client, 42, size); !errors.Is(err, ErrTelegramConfiguration) {
+			t.Fatalf("PooledAPI(size=%d) = %v, want ErrTelegramConfiguration", size, err)
+		}
+	}
 }
 
 func TestFactoryPooledMigrationRetainsConnectionCountAndReusesDCs(t *testing.T) {

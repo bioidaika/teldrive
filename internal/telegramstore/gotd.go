@@ -152,11 +152,11 @@ func (s *GotdStorage) Metadata(ctx context.Context, request MetadataRequest) (St
 	}
 	var stored StoredPart
 	err := s.runner.Run(ctx, request.UserID, OperationDownload, func(runCtx context.Context, api *tg.Client) error {
-		_, size, err := fetchDocumentLocation(runCtx, api, request.ChannelID, request.MessageID, s.globalCache)
+		doc, err := fetchDocumentLocation(runCtx, api, request.ChannelID, request.MessageID, s.globalCache)
 		if err != nil {
 			return err
 		}
-		stored = StoredPart{ChannelID: request.ChannelID, MessageID: request.MessageID, Size: size}
+		stored = StoredPart{ChannelID: request.ChannelID, MessageID: request.MessageID, Size: doc.Size}
 		return nil
 	})
 	if err != nil {
@@ -173,30 +173,29 @@ func (s *GotdStorage) OpenRange(ctx context.Context, request RangeRequest) (io.R
 	reader := newTelegramRangeReader(streamCtx, cancel, s.downloadReadBuffers, s.downloadReadParallel)
 	go func() {
 		err := runWithConnections(streamCtx, s.runner, request.UserID, OperationDownload, s.downloadReadParallel, func(runCtx context.Context, api *tg.Client) error {
-			location, documentSize, err := fetchDocumentLocation(runCtx, api, request.ChannelID, request.MessageID, s.globalCache)
+			doc, err := fetchDocumentLocation(runCtx, api, request.ChannelID, request.MessageID, s.globalCache)
 			if err != nil {
 				return err
 			}
-			refresh := func(refreshCtx context.Context) (*tg.InputDocumentFileLocation, error) {
-				refreshed, _, refreshErr := refreshDocumentLocation(refreshCtx, api, request.ChannelID, request.MessageID, s.globalCache)
-				return refreshed, refreshErr
+			refresh := func(refreshCtx context.Context) (cachedDocumentLocation, error) {
+				return refreshDocumentLocation(refreshCtx, api, request.ChannelID, request.MessageID, s.globalCache)
 			}
-			return fillRangeWithLocation(runCtx, api, request, reader, location, documentSize, refresh)
+			return fillRangeWithLocation(runCtx, api, request, reader, doc, refresh)
 		})
 		reader.finish(err)
 	}()
 	return reader, nil
 }
 
-func fillRangeWithLocation(ctx context.Context, api *tg.Client, request RangeRequest, reader *telegramRangeReader, location *tg.InputDocumentFileLocation, documentSize int64, refresh func(context.Context) (*tg.InputDocumentFileLocation, error)) error {
-	if request.Offset > documentSize {
+func fillRangeWithLocation(ctx context.Context, api *tg.Client, request RangeRequest, reader *telegramRangeReader, doc cachedDocumentLocation, refresh func(context.Context) (cachedDocumentLocation, error)) error {
+	if request.Offset > doc.Size {
 		return io.EOF
 	}
 	remaining := request.Length
-	if remaining < 0 || request.Offset+remaining > documentSize {
-		remaining = documentSize - request.Offset
+	if remaining < 0 || request.Offset+remaining > doc.Size {
+		remaining = doc.Size - request.Offset
 	}
-	return reader.fill(ctx, api, location, request.Offset, remaining, refresh)
+	return reader.fillDocument(ctx, api, doc, request.Offset, remaining, refresh)
 }
 
 type gotdDownloadSession struct {
@@ -221,28 +220,21 @@ type gotdDownloadSession struct {
 type cachedDocumentLocation struct {
 	Location *tg.InputDocumentFileLocation `msgpack:"location"`
 	Size     int64                         `msgpack:"size"`
+	DCID     int                           `msgpack:"dc_id"`
 }
 
-func fetchDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64, c cache.Cacher) (*tg.InputDocumentFileLocation, int64, error) {
+func fetchDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64, c cache.Cacher) (cachedDocumentLocation, error) {
 	clientID, ok := ClientID(ctx)
 	if c == nil || !ok {
 		return documentLocation(ctx, api, channelID, messageID)
 	}
 	gk := cache.Key("telegram", "document", clientID, channelID, messageID)
-	result, err := cache.Fetch(ctx, c, gk, 4*time.Hour, func() (cachedDocumentLocation, error) {
-		loc, size, err := documentLocation(ctx, api, channelID, messageID)
-		if err != nil {
-			return cachedDocumentLocation{}, err
-		}
-		return cachedDocumentLocation{Location: loc, Size: size}, nil
+	return cache.Fetch(ctx, c, gk, 4*time.Hour, func() (cachedDocumentLocation, error) {
+		return documentLocation(ctx, api, channelID, messageID)
 	})
-	if err != nil {
-		return nil, 0, err
-	}
-	return result.Location, result.Size, nil
 }
 
-func refreshDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64, c cache.Cacher) (*tg.InputDocumentFileLocation, int64, error) {
+func refreshDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64, c cache.Cacher) (cachedDocumentLocation, error) {
 	clientID, ok := ClientID(ctx)
 	if c != nil && ok {
 		_ = c.Delete(ctx, cache.Key("telegram", "document", clientID, channelID, messageID))
@@ -301,12 +293,13 @@ func (s *gotdDownloadSession) Metadata(ctx context.Context, request MetadataRequ
 	if err != nil {
 		return StoredPart{}, err
 	}
-	_, size, err := s.documentLocation(ctx, api, request.ChannelID, request.MessageID)
+	ctx = WithClientID(ctx, s.clientID)
+	doc, err := s.documentLocation(ctx, api, request.ChannelID, request.MessageID)
 	if err != nil {
 		s.reportError(ctx, err)
 		return StoredPart{}, err
 	}
-	return StoredPart{ChannelID: request.ChannelID, MessageID: request.MessageID, Size: size}, nil
+	return StoredPart{ChannelID: request.ChannelID, MessageID: request.MessageID, Size: doc.Size}, nil
 }
 
 func (s *gotdDownloadSession) OpenRange(ctx context.Context, request RangeRequest) (io.ReadCloser, error) {
@@ -314,20 +307,19 @@ func (s *gotdDownloadSession) OpenRange(ctx context.Context, request RangeReques
 	if err != nil {
 		return nil, err
 	}
-	streamCtx, cancel := context.WithCancel(ctx)
+	streamCtx, cancel := context.WithCancel(WithClientID(ctx, s.clientID))
 	reader := newTelegramRangeReader(streamCtx, cancel, s.downloadReadBuffers, s.downloadReadParallel)
 	go func() {
-		location, size, locationErr := s.documentLocation(streamCtx, api, request.ChannelID, request.MessageID)
+		doc, locationErr := s.documentLocation(streamCtx, api, request.ChannelID, request.MessageID)
 		if locationErr != nil {
 			s.reportError(streamCtx, locationErr)
 			reader.finish(locationErr)
 			return
 		}
-		refresh := func(refreshCtx context.Context) (*tg.InputDocumentFileLocation, error) {
-			refreshed, _, refreshErr := s.refreshDocumentLocation(refreshCtx, api, request.ChannelID, request.MessageID)
-			return refreshed, refreshErr
+		refresh := func(refreshCtx context.Context) (cachedDocumentLocation, error) {
+			return s.refreshDocumentLocation(refreshCtx, api, request.ChannelID, request.MessageID)
 		}
-		fillErr := fillRangeWithLocation(streamCtx, api, request, reader, location, size, refresh)
+		fillErr := fillRangeWithLocation(streamCtx, api, request, reader, doc, refresh)
 		if fillErr != nil {
 			s.reportError(streamCtx, fillErr)
 		}
@@ -342,11 +334,11 @@ func (s *gotdDownloadSession) reportError(ctx context.Context, err error) {
 	}
 }
 
-func (s *gotdDownloadSession) documentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (*tg.InputDocumentFileLocation, int64, error) {
+func (s *gotdDownloadSession) documentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (cachedDocumentLocation, error) {
 	return fetchDocumentLocation(WithClientID(ctx, s.clientID), api, channelID, messageID, s.globalCache)
 }
 
-func (s *gotdDownloadSession) refreshDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (*tg.InputDocumentFileLocation, int64, error) {
+func (s *gotdDownloadSession) refreshDocumentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (cachedDocumentLocation, error) {
 	return refreshDocumentLocation(WithClientID(ctx, s.clientID), api, channelID, messageID, s.globalCache)
 }
 
@@ -465,6 +457,20 @@ func (r *telegramRangeReader) finish(err error) {
 }
 
 func (r *telegramRangeReader) fill(ctx context.Context, api *tg.Client, location *tg.InputDocumentFileLocation, offset, remaining int64, refresh func(context.Context) (*tg.InputDocumentFileLocation, error)) error {
+	var refreshDoc func(context.Context) (cachedDocumentLocation, error)
+	if refresh != nil {
+		refreshDoc = func(refreshCtx context.Context) (cachedDocumentLocation, error) {
+			loc, err := refresh(refreshCtx)
+			if err != nil {
+				return cachedDocumentLocation{}, err
+			}
+			return cachedDocumentLocation{Location: loc}, nil
+		}
+	}
+	return r.fillDocument(ctx, api, cachedDocumentLocation{Location: location}, offset, remaining, refreshDoc)
+}
+
+func (r *telegramRangeReader) fillDocument(ctx context.Context, api *tg.Client, doc cachedDocumentLocation, offset, remaining int64, refresh func(context.Context) (cachedDocumentLocation, error)) error {
 	type readResult struct {
 		seq     int64
 		payload []byte
@@ -474,7 +480,7 @@ func (r *telegramRangeReader) fill(ctx context.Context, api *tg.Client, location
 	fetchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	completed := make(chan readResult, r.parallel)
-	currentLocation := location
+	currentDoc := doc
 	var locationMu sync.RWMutex
 	var refreshMu sync.Mutex
 
@@ -495,12 +501,12 @@ func (r *telegramRangeReader) fill(ctx context.Context, api *tg.Client, location
 		go func() {
 			result := readResult{seq: seq}
 			locationMu.RLock()
-			usedLocation := currentLocation
+			usedDoc := currentDoc
 			locationMu.RUnlock()
 
-			download := func(callCtx context.Context, loc *tg.InputDocumentFileLocation) (tg.UploadFileClass, error) {
-				return api.UploadGetFile(callCtx, &tg.UploadGetFileRequest{
-					Location: loc,
+			download := func(callCtx context.Context, target cachedDocumentLocation) (tg.UploadFileClass, error) {
+				return api.UploadGetFile(withDocumentDC(callCtx, target.DCID), &tg.UploadGetFileRequest{
+					Location: target.Location,
 					Offset:   plan.offset,
 					Limit:    plan.limit,
 					Precise:  true,
@@ -511,27 +517,30 @@ func (r *telegramRangeReader) fill(ctx context.Context, api *tg.Client, location
 			var err error
 			for range r.attempts {
 				attemptCtx, attemptCancel := context.WithTimeout(fetchCtx, r.timeout)
-				response, err = download(attemptCtx, usedLocation)
+				response, err = download(attemptCtx, usedDoc)
 				if _, expired := tgerr.AsType(err, "FILE_REFERENCE_EXPIRED"); expired && refresh != nil {
 					refreshMu.Lock()
 					locationMu.RLock()
-					latestLocation := currentLocation
+					latestDoc := currentDoc
 					locationMu.RUnlock()
-					if latestLocation == usedLocation {
+					if latestDoc.Location == usedDoc.Location {
 						refreshed, refreshErr := refresh(attemptCtx)
 						if refreshErr != nil {
 							err = refreshErr
 						} else {
+							if refreshed.DCID <= 0 {
+								refreshed.DCID = latestDoc.DCID
+							}
 							locationMu.Lock()
-							currentLocation = refreshed
+							currentDoc = refreshed
 							locationMu.Unlock()
-							latestLocation = refreshed
+							latestDoc = refreshed
 						}
 					}
 					refreshMu.Unlock()
-					if latestLocation != nil && latestLocation != usedLocation {
-						usedLocation = latestLocation
-						response, err = download(attemptCtx, latestLocation)
+					if latestDoc.Location != nil && latestDoc.Location != usedDoc.Location {
+						usedDoc = latestDoc
+						response, err = download(attemptCtx, latestDoc)
 					}
 				}
 				attemptCancel()
@@ -639,10 +648,12 @@ func (s *GotdStorage) CopyPart(ctx context.Context, userID, sourceChannelID, sou
 	}
 	var copied StoredPart
 	err := s.runner.Run(ctx, userID, OperationManage, func(runCtx context.Context, api *tg.Client) error {
-		location, size, err := documentLocation(runCtx, api, sourceChannelID, sourceMessageID)
+		doc, err := documentLocation(runCtx, api, sourceChannelID, sourceMessageID)
 		if err != nil {
 			return err
 		}
+		location := doc.Location
+		size := doc.Size
 		destination, err := inputChannel(runCtx, api, destinationChannelID)
 		if err != nil {
 			return err
@@ -948,31 +959,35 @@ func uploadedMessage(response tg.UpdatesClass) (int64, int64, error) {
 	return 0, 0, ErrMessageNotFound
 }
 
-func documentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (*tg.InputDocumentFileLocation, int64, error) {
+func documentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (cachedDocumentLocation, error) {
 	channel, err := inputChannel(ctx, api, channelID)
 	if err != nil {
-		return nil, 0, err
+		return cachedDocumentLocation{}, err
 	}
 	response, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: channel,
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: int(messageID)}},
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("get Telegram document message: %w", err)
+		return cachedDocumentLocation{}, fmt.Errorf("get Telegram document message: %w", err)
 	}
 	modified, ok := response.AsModified()
 	if !ok || len(modified.GetMessages()) == 0 {
-		return nil, 0, ErrMessageNotFound
+		return cachedDocumentLocation{}, ErrMessageNotFound
 	}
 	msg, ok := modified.GetMessages()[0].(*tg.Message)
 	if !ok {
-		return nil, 0, ErrMessageNotFound
+		return cachedDocumentLocation{}, ErrMessageNotFound
 	}
 	document, ok := messageDocument(msg)
 	if !ok {
-		return nil, 0, ErrDocumentNotFound
+		return cachedDocumentLocation{}, ErrDocumentNotFound
 	}
-	return document.AsInputDocumentFileLocation(""), document.Size, nil
+	return cachedDocumentLocation{
+		Location: document.AsInputDocumentFileLocation(""),
+		Size:     document.Size,
+		DCID:     document.DCID,
+	}, nil
 }
 
 func messageDocument(msg *tg.Message) (*tg.Document, bool) {

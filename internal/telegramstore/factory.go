@@ -22,6 +22,7 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/gotd/td/transport"
 	"github.com/iyear/connectproxy"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -234,6 +235,7 @@ func (f *Factory) NewWithUpdates(storage telegram.SessionStorage, handler telegr
 type dcPoolClient interface {
 	Pool(max int64) (telegram.CloseInvoker, error)
 	DC(ctx context.Context, dc int, max int64) (telegram.CloseInvoker, error)
+	HomeDC() int
 }
 
 // PooledAPI opens up to size connections per DC and charges their requests to
@@ -243,37 +245,56 @@ func (f *Factory) PooledAPI(client *telegram.Client, accountID int64, size int) 
 	if f == nil || client == nil || accountID <= 0 || size < 1 {
 		return nil, nil, ErrTelegramConfiguration
 	}
-	return f.pooledAPI(&realDCPoolClient{client: client}, accountID, 1)
+	return f.pooledAPI(&realDCPoolClient{client: client}, accountID, size)
 }
 
 type realDCPoolClient struct {
 	client *telegram.Client
 }
 
-func (c *realDCPoolClient) Pool(max int64) (telegram.CloseInvoker, error) {
-	p, err := c.client.Pool(1)
+func (c *realDCPoolClient) HomeDC() int {
+	if c == nil || c.client == nil {
+		return 0
+	}
+	return c.client.Config().ThisDC
+}
+
+func (c *realDCPoolClient) Pool(size int64) (telegram.CloseInvoker, error) {
+	if size < 1 {
+		size = 1
+	}
+	p, err := c.client.Pool(size)
 	if err != nil {
 		return nil, err
 	}
-	return newShieldedDCPool(p), nil
+	return newShieldedDCPool(p, int(size)), nil
 }
 
-func (c *realDCPoolClient) DC(ctx context.Context, dc int, max int64) (telegram.CloseInvoker, error) {
+func (c *realDCPoolClient) DC(ctx context.Context, dc int, size int64) (telegram.CloseInvoker, error) {
+	if size < 1 {
+		size = 1
+	}
+	if home := c.HomeDC(); home > 0 && home == dc {
+		return c.Pool(size)
+	}
 	openCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	p, err := c.client.DC(openCtx, dc, 1)
+	p, err := c.client.DC(openCtx, dc, size)
 	if err != nil {
+		if tgerr.Is(err, "DC_ID_INVALID") {
+			return c.Pool(size)
+		}
 		return nil, err
 	}
-	return newShieldedDCPool(p), nil
+	return newShieldedDCPool(p, int(size)), nil
 }
 
-// shieldedDCPool serializes access to a single-connection gotd *pool.DC and
-// shields in-flight RPCs and connection initialization from caller
-// context.Canceled. In gotd/td/pool, cancelling ctx while acquire() is waiting
-// on <-conn.Ready() leaks c.total permanently, and cancelling ctx while an RPC
-// is on the wire triggers a synchronous 15s RPCDropAnswerRequest before
-// releasing the connection back to the pool.
+// shieldedDCPool bounds concurrent access to a gotd *pool.DC and shields
+// in-flight RPCs and connection initialization from caller context.Canceled.
+// In gotd/td/pool, cancelling ctx while acquire() is waiting on <-conn.Ready()
+// leaks c.total permanently, and cancelling ctx while an RPC is on the wire
+// triggers a synchronous 15s RPCDropAnswerRequest before releasing the
+// connection back to the pool.
 type shieldedDCPool struct {
 	inner    telegram.CloseInvoker
 	sem      chan struct{}
@@ -282,11 +303,14 @@ type shieldedDCPool struct {
 	closeOne sync.Once
 }
 
-func newShieldedDCPool(inner telegram.CloseInvoker) *shieldedDCPool {
+func newShieldedDCPool(inner telegram.CloseInvoker, size int) *shieldedDCPool {
+	if size < 1 {
+		size = 1
+	}
 	closeCtx, cancel := context.WithCancel(context.Background())
 	return &shieldedDCPool{
 		inner:    inner,
-		sem:      make(chan struct{}, 1),
+		sem:      make(chan struct{}, size),
 		closeCtx: closeCtx,
 		cancel:   cancel,
 	}
@@ -360,6 +384,7 @@ func (f *Factory) pooledAPI(client dcPoolClient, accountID int64, size int) (*tg
 		// same path as invokeSub, but preserves our multi-connection pool size.
 		return client.DC(ctx, dc, int64(size))
 	}, func(invoker tg.Invoker) tg.Invoker { return f.wrapInvoker(accountID, invoker) })
+	router.homeDC = client.HomeDC
 	router.openHome = func() (telegram.CloseInvoker, error) {
 		return client.Pool(int64(size))
 	}
