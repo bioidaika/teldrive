@@ -70,6 +70,7 @@ type downloadClientEntry struct {
 	done     chan struct{}
 	api      *tg.Client
 	err      error
+	evicted  bool
 	refs     int
 	lastUsed time.Time
 }
@@ -141,6 +142,7 @@ func (p *DownloadClientPool) openDownloadSession(ctx context.Context, userID int
 			clientID:             entry.clientID,
 			clientFn:             func() (*tg.Client, error) { return p.client(entry, api) },
 			closeFn:              func() error { release(); return nil },
+			onError:              func(callCtx context.Context, err error) { p.evictOnTimeout(callCtx, entry, err) },
 			downloadReadBuffers:  p.config.ReadBuffers,
 			downloadReadParallel: p.config.ReadParallel,
 			globalCache:          p.globalCache,
@@ -162,7 +164,7 @@ func (p *DownloadClientPool) lease(key downloadClientKey) (*downloadClientEntry,
 	if p.closed {
 		return nil, false, ErrDownloadClientPoolClosed
 	}
-	if entry := p.entries[key]; entry != nil && entry.err == nil && entry.ctx.Err() == nil {
+	if entry := p.entries[key]; entry != nil && !entry.evicted && entry.err == nil && entry.ctx.Err() == nil {
 		entry.refs++
 		return entry, false, nil
 	}
@@ -211,13 +213,40 @@ func (p *DownloadClientPool) client(entry *downloadClientEntry, expected *tg.Cli
 
 func (p *DownloadClientPool) release(entry *downloadClientEntry) {
 	p.mu.Lock()
+	cancelNow := false
 	if entry.refs > 0 {
 		entry.refs--
 		if entry.refs == 0 {
 			entry.lastUsed = time.Now()
+			cancelNow = entry.evicted
 		}
 	}
 	p.mu.Unlock()
+	if cancelNow {
+		entry.cancel()
+	}
+}
+
+func (p *DownloadClientPool) evictOnTimeout(callCtx context.Context, entry *downloadClientEntry, err error) {
+	if callCtx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		p.evict(entry)
+	}
+}
+
+func (p *DownloadClientPool) evict(entry *downloadClientEntry) {
+	if p == nil || entry == nil {
+		return
+	}
+	p.mu.Lock()
+	entry.evicted = true
+	if p.entries[entry.key] == entry {
+		delete(p.entries, entry.key)
+	}
+	cancelNow := entry.refs == 0
+	p.mu.Unlock()
+	if cancelNow {
+		entry.cancel()
+	}
 }
 
 func (p *DownloadClientPool) reap() {

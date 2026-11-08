@@ -72,14 +72,14 @@ func NewUploadAwareRunner(pool *pgxpool.Pool, cipher *secureblob.Cipher, factory
 }
 
 func (r *UploadAwareRunner) Run(ctx context.Context, userID int64, operation telegramstore.Operation, fn func(context.Context, *tg.Client) error) error {
-	return r.run(ctx, userID, operation, 1, fn)
+	return r.run(ctx, userID, operation, 1, false, fn)
 }
 
 func (r *UploadAwareRunner) RunPooled(ctx context.Context, userID int64, operation telegramstore.Operation, connections int, fn func(context.Context, *tg.Client) error) error {
-	return r.run(ctx, userID, operation, connections, fn)
+	return r.run(ctx, userID, operation, connections, true, fn)
 }
 
-func (r *UploadAwareRunner) run(ctx context.Context, userID int64, operation telegramstore.Operation, connections int, fn func(context.Context, *tg.Client) error) error {
+func (r *UploadAwareRunner) run(ctx context.Context, userID int64, operation telegramstore.Operation, connections int, pooled bool, fn func(context.Context, *tg.Client) error) error {
 	if fn == nil {
 		return ErrUploadRunnerConfiguration
 	}
@@ -89,9 +89,9 @@ func (r *UploadAwareRunner) run(ctx context.Context, userID int64, operation tel
 			return err
 		}
 		if bot == nil {
-			return r.runFallback(ctx, userID, operation, connections, fn)
+			return r.runFallback(ctx, userID, operation, connections, pooled, fn)
 		}
-		started, err := r.runAcquired(ctx, userID, operation, bot, connections, fn)
+		started, err := r.runAcquired(ctx, userID, operation, bot, connections, pooled, fn)
 		// A revoked bot is disabled and no longer eligible. Retrying on the
 		// next bot is safe only while fn has not run on the revoked one.
 		if started || !errors.Is(err, telegramstore.ErrAccountRevoked) {
@@ -100,9 +100,9 @@ func (r *UploadAwareRunner) run(ctx context.Context, userID int64, operation tel
 	}
 }
 
-func (r *UploadAwareRunner) runAcquired(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, fn func(context.Context, *tg.Client) error) (bool, error) {
+func (r *UploadAwareRunner) runAcquired(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, pooled bool, fn func(context.Context, *tg.Client) error) (bool, error) {
 	defer r.load.release(bot.BotID, connections)
-	started, err := r.runOnBotRecorded(ctx, userID, operation, bot, connections, fn)
+	started, err := r.runOnBotRecorded(ctx, userID, operation, bot, connections, pooled, fn)
 	if err != nil {
 		return started, err
 	}
@@ -114,9 +114,9 @@ func (r *UploadAwareRunner) runAcquired(ctx context.Context, userID int64, opera
 
 // runOnBotRecorded runs fn on bot, records any failure against the bot, and
 // reports whether fn started.
-func (r *UploadAwareRunner) runOnBotRecorded(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, fn func(context.Context, *tg.Client) error) (bool, error) {
+func (r *UploadAwareRunner) runOnBotRecorded(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, pooled bool, fn func(context.Context, *tg.Client) error) (bool, error) {
 	started := false
-	err := r.runOnBot(ctx, userID, operation, bot, connections, func(runCtx context.Context, api *tg.Client) error {
+	err := r.runOnBot(ctx, userID, operation, bot, connections, pooled, func(runCtx context.Context, api *tg.Client) error {
 		started = true
 		return fn(runCtx, api)
 	})
@@ -200,11 +200,11 @@ func (r *UploadAwareRunner) acquireBot(ctx context.Context, userID int64, operat
 	return r.load.acquire(bots, selection, connections), nil
 }
 
-func (r *UploadAwareRunner) runOnBot(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, fn func(context.Context, *tg.Client) error) error {
+func (r *UploadAwareRunner) runOnBot(ctx context.Context, userID int64, operation telegramstore.Operation, bot *sqlcgen.Bot, connections int, pooled bool, fn func(context.Context, *tg.Client) error) error {
 	if r.runBotFunc != nil {
 		return r.runBotFunc(ctx, userID, bot, connections, fn)
 	}
-	return r.runBot(ctx, userID, bot, connections, operation == telegramstore.OperationDownload, fn)
+	return r.runBot(ctx, userID, bot, connections, pooled, operation == telegramstore.OperationDownload, fn)
 }
 
 // runBot runs fn on a client logged in as bot. With failFast, the first failed
@@ -212,7 +212,7 @@ func (r *UploadAwareRunner) runOnBot(ctx context.Context, userID int64, operatio
 // errBotUnreachable. Otherwise gotd keeps reconnecting until ctx is done or the
 // reconnect timeout (five minutes by default) passes, so callers that give up
 // sooner would never learn that the bot is unreachable.
-func (r *UploadAwareRunner) runBot(ctx context.Context, userID int64, bot *sqlcgen.Bot, connections int, failFast bool, fn func(context.Context, *tg.Client) error) error {
+func (r *UploadAwareRunner) runBot(ctx context.Context, userID int64, bot *sqlcgen.Bot, connections int, pooled, failFast bool, fn func(context.Context, *tg.Client) error) error {
 	storage := &botSessionStorage{
 		queries: r.queries, cipher: r.cipher, userID: userID, botID: bot.BotID,
 		stored: append([]byte(nil), bot.Session...),
@@ -248,13 +248,13 @@ func (r *UploadAwareRunner) runBot(ctx context.Context, userID int64, bot *sqlcg
 			}
 		}
 		api := client.API()
-		if connections > 1 {
-			pooled, closePool, err := r.factory.PooledAPI(client, bot.BotID, connections)
+		if pooled || connections > 1 {
+			pooledAPI, closePool, err := r.factory.PooledAPI(client, bot.BotID, max(connections, 1))
 			if err != nil {
 				return fmt.Errorf("create pooled API: %w", err)
 			}
 			defer closePool()
-			api = pooled
+			api = pooledAPI
 		}
 		return fn(telegramstore.WithClientID(runCtx, bot.BotID), api)
 	})
@@ -265,9 +265,9 @@ func (r *UploadAwareRunner) runBot(ctx context.Context, userID int64, bot *sqlcg
 	return err
 }
 
-func (r *UploadAwareRunner) runFallback(ctx context.Context, userID int64, operation telegramstore.Operation, connections int, fn func(context.Context, *tg.Client) error) error {
-	if pooled, ok := r.fallback.(telegramstore.PooledRunner); ok && connections > 1 {
-		return pooled.RunPooled(ctx, userID, operation, connections, fn)
+func (r *UploadAwareRunner) runFallback(ctx context.Context, userID int64, operation telegramstore.Operation, connections int, pooled bool, fn func(context.Context, *tg.Client) error) error {
+	if pooledRunner, ok := r.fallback.(telegramstore.PooledRunner); ok && (pooled || connections > 1) {
+		return pooledRunner.RunPooled(ctx, userID, operation, max(connections, 1), fn)
 	}
 	return r.fallback.Run(ctx, userID, operation, fn)
 }
@@ -322,7 +322,7 @@ type botLease struct {
 func (l *botLease) AccountID() int64 { return l.bot.BotID }
 
 func (l *botLease) RunPooled(ctx context.Context, connections int, fn func(context.Context, *tg.Client) error) error {
-	_, err := l.runner.runOnBotRecorded(ctx, l.userID, l.operation, l.bot, connections, fn)
+	_, err := l.runner.runOnBotRecorded(ctx, l.userID, l.operation, l.bot, connections, true, fn)
 	return err
 }
 
@@ -339,7 +339,7 @@ type fallbackLease struct {
 func (l *fallbackLease) AccountID() int64 { return l.userID }
 
 func (l *fallbackLease) RunPooled(ctx context.Context, connections int, fn func(context.Context, *tg.Client) error) error {
-	return l.runner.runFallback(ctx, l.userID, l.operation, connections, fn)
+	return l.runner.runFallback(ctx, l.userID, l.operation, connections, true, fn)
 }
 
 func (l *fallbackLease) Release() {}

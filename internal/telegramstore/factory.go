@@ -255,6 +255,9 @@ func (f *Factory) pooledAPI(client dcPoolClient, accountID int64, size int) (*tg
 		// same path as invokeSub, but preserves our multi-connection pool size.
 		return client.DC(ctx, dc, int64(size))
 	}, func(invoker tg.Invoker) tg.Invoker { return f.wrapInvoker(accountID, invoker) })
+	router.openHome = func() (telegram.CloseInvoker, error) {
+		return client.Pool(int64(size))
+	}
 	return tg.NewClient(router), router.Close, nil
 }
 

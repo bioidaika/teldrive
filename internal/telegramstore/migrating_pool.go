@@ -26,13 +26,14 @@ type dcPoolEntry struct {
 // single-connection pool, target pools retain the configured connection count.
 // Each request starts on the home DC: different files may live on different DCs.
 type migratingPool struct {
-	home   telegram.CloseInvoker
-	api    tg.Invoker
-	open   func(context.Context, int) (telegram.CloseInvoker, error)
-	wrap   func(tg.Invoker) tg.Invoker
-	mu     sync.Mutex
-	pools  map[int]*dcPoolEntry
-	closed bool
+	home     telegram.CloseInvoker
+	api      tg.Invoker
+	openHome func() (telegram.CloseInvoker, error)
+	open     func(context.Context, int) (telegram.CloseInvoker, error)
+	wrap     func(tg.Invoker) tg.Invoker
+	mu       sync.Mutex
+	pools    map[int]*dcPoolEntry
+	closed   bool
 }
 
 func newMigratingPool(home telegram.CloseInvoker, open func(context.Context, int) (telegram.CloseInvoker, error), wrap func(tg.Invoker) tg.Invoker) *migratingPool {
@@ -42,11 +43,17 @@ func newMigratingPool(home telegram.CloseInvoker, open func(context.Context, int
 func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	p.mu.Lock()
 	closed := p.closed
+	home := p.home
+	api := p.api
 	p.mu.Unlock()
 	if closed {
 		return errMigratingPoolClosed
 	}
-	err := p.api.Invoke(ctx, input, output)
+	err := api.Invoke(ctx, input, output)
+	if errors.Is(err, context.DeadlineExceeded) {
+		p.resetHome(home)
+		return err
+	}
 	rpcErr, ok := tgerr.As(err)
 	if !ok || !rpcErr.IsOneOf("FILE_MIGRATE", "STATS_MIGRATE") || rpcErr.Argument <= 0 {
 		return err
@@ -55,16 +62,20 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 }
 
 func (p *migratingPool) invokeSub(ctx context.Context, dc int, input bin.Encoder, output bin.Decoder) error {
-	api, openErr := p.target(ctx, dc)
+	entry, openErr := p.target(ctx, dc)
 	if openErr != nil {
 		return fmt.Errorf("open Telegram target DC %d: %w", dc, openErr)
 	}
 	// Like gotd's invokeSub, invoke directly on the authorized target rather
 	// than recursively redirecting or changing the primary session.
-	return api.Invoke(ctx, input, output)
+	err := entry.api.Invoke(ctx, input, output)
+	if errors.Is(err, context.DeadlineExceeded) {
+		p.evictTarget(dc, entry)
+	}
+	return err
 }
 
-func (p *migratingPool) target(ctx context.Context, dc int) (tg.Invoker, error) {
+func (p *migratingPool) target(ctx context.Context, dc int) (*dcPoolEntry, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -76,7 +87,7 @@ func (p *migratingPool) target(ctx context.Context, dc int) (tg.Invoker, error) 
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-entry.ready:
-			return entry.api, entry.err
+			return entry, entry.err
 		}
 	}
 	entry := &dcPoolEntry{ready: make(chan struct{})}
@@ -97,7 +108,45 @@ func (p *migratingPool) target(ctx context.Context, dc int) (tg.Invoker, error) 
 	entry.err = err
 	close(entry.ready)
 	p.mu.Unlock()
-	return entry.api, entry.err
+	return entry, entry.err
+}
+
+func (p *migratingPool) resetHome(failed telegram.CloseInvoker) {
+	if p.openHome == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.home != failed {
+		p.mu.Unlock()
+		return
+	}
+	replacement, err := p.openHome()
+	if err != nil {
+		p.mu.Unlock()
+		return
+	}
+	p.home = replacement
+	p.api = p.wrap(replacement)
+	p.mu.Unlock()
+	if failed != nil {
+		_ = failed.Close()
+	}
+}
+
+func (p *migratingPool) evictTarget(dc int, failed *dcPoolEntry) {
+	if failed == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.pools[dc] != failed {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.pools, dc)
+	p.mu.Unlock()
+	if failed.pool != nil {
+		_ = failed.pool.Close()
+	}
 }
 
 func (p *migratingPool) Close() error {

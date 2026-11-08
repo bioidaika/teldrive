@@ -161,3 +161,63 @@ func TestMigratingPoolCancelledWaiterAndCloseDuringOpen(t *testing.T) {
 		t.Fatal("late pool leaked")
 	}
 }
+
+func TestMigratingPoolEvictsTimedOutTargetAndReopensOnRetry(t *testing.T) {
+	var opens int
+	firstTarget := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		return context.DeadlineExceeded
+	}}
+	secondTarget := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		return nil
+	}}
+	router := newMigratingPool(fileRedirectPool(4), func(context.Context, int) (telegram.CloseInvoker, error) {
+		opens++
+		if opens == 1 {
+			return firstTarget, nil
+		}
+		return secondTarget, nil
+	}, unwrappedPool)
+	defer router.Close()
+
+	if err := router.Invoke(context.Background(), nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Invoke() = %v, want context.DeadlineExceeded", err)
+	}
+	if firstTarget.closes.Load() != 1 {
+		t.Fatalf("first target closes = %d, want 1", firstTarget.closes.Load())
+	}
+	if err := router.Invoke(context.Background(), nil, nil); err != nil {
+		t.Fatalf("second Invoke() = %v, want nil", err)
+	}
+	if opens != 2 {
+		t.Fatalf("target opens = %d, want 2", opens)
+	}
+}
+
+func TestMigratingPoolResetsTimedOutHomePool(t *testing.T) {
+	firstHome := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		return context.DeadlineExceeded
+	}}
+	secondHome := &testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		return nil
+	}}
+	router := newMigratingPool(firstHome, func(context.Context, int) (telegram.CloseInvoker, error) {
+		t.Fatal("unexpected target DC open")
+		return nil, nil
+	}, unwrappedPool)
+	var homeOpens int
+	router.openHome = func() (telegram.CloseInvoker, error) {
+		homeOpens++
+		return secondHome, nil
+	}
+	defer router.Close()
+
+	if err := router.Invoke(context.Background(), nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Invoke() = %v, want context.DeadlineExceeded", err)
+	}
+	if firstHome.closes.Load() != 1 || homeOpens != 1 {
+		t.Fatalf("firstHome closes = %d, homeOpens = %d; want 1 and 1", firstHome.closes.Load(), homeOpens)
+	}
+	if err := router.Invoke(context.Background(), nil, nil); err != nil {
+		t.Fatalf("second Invoke() = %v, want nil", err)
+	}
+}

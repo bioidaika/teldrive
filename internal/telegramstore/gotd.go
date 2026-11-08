@@ -208,6 +208,7 @@ type gotdDownloadSession struct {
 	err                  error
 	clientFn             func() (*tg.Client, error)
 	closeFn              func() error
+	onError              func(context.Context, error)
 	close                sync.Once
 	mu                   sync.Mutex
 	downloadReadBuffers  int
@@ -302,6 +303,7 @@ func (s *gotdDownloadSession) Metadata(ctx context.Context, request MetadataRequ
 	}
 	_, size, err := s.documentLocation(ctx, api, request.ChannelID, request.MessageID)
 	if err != nil {
+		s.reportError(ctx, err)
 		return StoredPart{}, err
 	}
 	return StoredPart{ChannelID: request.ChannelID, MessageID: request.MessageID, Size: size}, nil
@@ -317,6 +319,7 @@ func (s *gotdDownloadSession) OpenRange(ctx context.Context, request RangeReques
 	go func() {
 		location, size, locationErr := s.documentLocation(streamCtx, api, request.ChannelID, request.MessageID)
 		if locationErr != nil {
+			s.reportError(streamCtx, locationErr)
 			reader.finish(locationErr)
 			return
 		}
@@ -324,9 +327,19 @@ func (s *gotdDownloadSession) OpenRange(ctx context.Context, request RangeReques
 			refreshed, _, refreshErr := s.refreshDocumentLocation(refreshCtx, api, request.ChannelID, request.MessageID)
 			return refreshed, refreshErr
 		}
-		reader.finish(fillRangeWithLocation(streamCtx, api, request, reader, location, size, refresh))
+		fillErr := fillRangeWithLocation(streamCtx, api, request, reader, location, size, refresh)
+		if fillErr != nil {
+			s.reportError(streamCtx, fillErr)
+		}
+		reader.finish(fillErr)
 	}()
 	return reader, nil
+}
+
+func (s *gotdDownloadSession) reportError(ctx context.Context, err error) {
+	if s.onError != nil && err != nil {
+		s.onError(ctx, err)
+	}
 }
 
 func (s *gotdDownloadSession) documentLocation(ctx context.Context, api *tg.Client, channelID, messageID int64) (*tg.InputDocumentFileLocation, int64, error) {

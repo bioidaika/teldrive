@@ -48,7 +48,7 @@ dockers_v2:
     ids:
       - teldrive
     images:
-      - "ghcr.io/tgdrive/{{ .ProjectName }}"
+      - "ghcr.io/bioidaika/{{ .ProjectName }}"
     tags:
       - "{{ .Tag }}"
       - "{{ .Major }}"
@@ -91,4 +91,4 @@ changelog:
       - Merge branch
 
 release:
-  draft: true
+  draft: false

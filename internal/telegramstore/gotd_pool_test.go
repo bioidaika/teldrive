@@ -67,6 +67,23 @@ func TestGotdDownloadSessionUsesConnectionPool(t *testing.T) {
 	}
 }
 
+func TestGotdDownloadSessionUsesConnectionPoolForSingleParallel(t *testing.T) {
+	t.Parallel()
+	runner := &recordingPooledRunner{}
+	storage := NewGotdStorage(runner, nil, WithDownloadReadParallel(1))
+
+	session, err := storage.OpenDownloadSession(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("OpenDownloadSession() error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if runner.pooledCalls != 1 || runner.regularCalls != 0 || runner.connections != 1 {
+		t.Fatalf("runner calls = pooled:%d regular:%d connections:%d", runner.pooledCalls, runner.regularCalls, runner.connections)
+	}
+}
+
 func TestRunWithConnectionsFallsBackToRegularRunner(t *testing.T) {
 	t.Parallel()
 	runner := &sessionCountingRunner{}

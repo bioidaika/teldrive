@@ -290,6 +290,43 @@ func TestDownloadClientPoolUsesConfiguredConnections(t *testing.T) {
 	closeDownloadClientPool(t, pool)
 }
 
+func TestDownloadClientPoolEvictsWarmClientOnStreamTimeout(t *testing.T) {
+	runner := newAccountLeaserStub(1)
+	pool := newTestDownloadClientPool(t, runner, DownloadClientPoolConfig{})
+
+	first, err := pool.OpenDownloadSession(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSession := first.(*gotdDownloadSession)
+	firstClient, err := firstSession.client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSession.reportError(context.Background(), context.DeadlineExceeded)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForExits(t, runner, 1)
+
+	second, err := pool.OpenDownloadSession(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondClient, err := second.(*gotdDownloadSession).client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondClient == firstClient {
+		t.Fatal("timed-out warm client was reused instead of replaced")
+	}
+	if got := runner.runs.Load(); got != 2 {
+		t.Fatalf("runner starts = %d, want 2", got)
+	}
+	_ = second.Close()
+	closeDownloadClientPool(t, pool)
+}
+
 func newTestDownloadClientPool(t *testing.T, leaser AccountLeaser, config DownloadClientPoolConfig) *DownloadClientPool {
 	t.Helper()
 	pool, err := NewDownloadClientPool(leaser, config, nil)

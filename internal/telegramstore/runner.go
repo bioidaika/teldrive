@@ -87,14 +87,14 @@ type PooledRunner interface {
 }
 
 func (r ClientRunner) Run(ctx context.Context, userID int64, operation Operation, fn func(context.Context, *tg.Client) error) error {
-	return r.run(ctx, userID, operation, 1, fn)
+	return r.run(ctx, userID, operation, 1, false, fn)
 }
 
 func (r ClientRunner) RunPooled(ctx context.Context, userID int64, operation Operation, connections int, fn func(context.Context, *tg.Client) error) error {
-	return r.run(ctx, userID, operation, connections, fn)
+	return r.run(ctx, userID, operation, connections, true, fn)
 }
 
-func (r ClientRunner) run(ctx context.Context, userID int64, operation Operation, connections int, fn func(context.Context, *tg.Client) error) error {
+func (r ClientRunner) run(ctx context.Context, userID int64, operation Operation, connections int, pooled bool, fn func(context.Context, *tg.Client) error) error {
 	if r.Provider == nil || userID <= 0 || connections < 1 || fn == nil {
 		return ErrInvalidRequest
 	}
@@ -125,16 +125,16 @@ func (r ClientRunner) run(ctx context.Context, userID int64, operation Operation
 		)
 
 		api := client.API()
-		if connections > 1 {
+		if pooled || connections > 1 {
 			if r.Factory == nil {
 				return ErrTelegramConfiguration
 			}
-			pooled, closePool, err := r.Factory.PooledAPI(client, status.User.ID, connections)
+			pooledAPI, closePool, err := r.Factory.PooledAPI(client, status.User.ID, connections)
 			if err != nil {
 				return err
 			}
 			defer closePool()
-			api = pooled
+			api = pooledAPI
 		}
 		return fn(WithClientID(runCtx, status.User.ID), api)
 	}); err != nil {
@@ -144,8 +144,8 @@ func (r ClientRunner) run(ctx context.Context, userID int64, operation Operation
 }
 
 func runWithConnections(ctx context.Context, runner Runner, userID int64, operation Operation, connections int, fn func(context.Context, *tg.Client) error) error {
-	if pooled, ok := runner.(PooledRunner); ok && connections > 1 {
-		return pooled.RunPooled(ctx, userID, operation, connections, fn)
+	if pooled, ok := runner.(PooledRunner); ok && (connections > 1 || operation == OperationDownload) {
+		return pooled.RunPooled(ctx, userID, operation, max(connections, 1), fn)
 	}
 	return runner.Run(ctx, userID, operation, fn)
 }
