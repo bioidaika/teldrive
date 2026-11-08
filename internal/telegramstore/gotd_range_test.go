@@ -313,14 +313,6 @@ func (i *rpcTimeoutThenSuccessDownloadInvoker) Invoke(_ context.Context, input b
 	return nil
 }
 
-func encodeTLResponse(response bin.Encoder, output bin.Decoder) error {
-	buf := new(bin.Buffer)
-	if err := response.Encode(buf); err != nil {
-		return err
-	}
-	return output.Decode(buf)
-}
-
 func TestGotdDownloadSessionOpenRangePropagatesDocumentDCAndClientID(t *testing.T) {
 	const (
 		wantClientID int64 = 777001
@@ -337,11 +329,12 @@ func TestGotdDownloadSessionOpenRangePropagatesDocumentDCAndClientID(t *testing.
 		}
 		switch input.(type) {
 		case *tg.ChannelsGetChannelsRequest:
-			return encodeTLResponse(&tg.MessagesChats{
+			output.(*tg.MessagesChatsBox).Chats = &tg.MessagesChats{
 				Chats: []tg.ChatClass{&tg.Channel{ID: channelID, AccessHash: 555, Broadcast: true}},
-			}, output)
+			}
+			return nil
 		case *tg.ChannelsGetMessagesRequest:
-			return encodeTLResponse(&tg.MessagesChannelMessages{
+			output.(*tg.MessagesMessagesBox).Messages = &tg.MessagesChannelMessages{
 				Messages: []tg.MessageClass{&tg.Message{
 					ID: int(messageID),
 					Media: &tg.MessageMediaDocument{
@@ -354,7 +347,8 @@ func TestGotdDownloadSessionOpenRangePropagatesDocumentDCAndClientID(t *testing.
 						},
 					},
 				}},
-			}, output)
+			}
+			return nil
 		case *tg.UploadGetFileRequest:
 			homeUploadCalls.Add(1)
 			return tgerr.New(-503, "Timeout")
@@ -372,10 +366,11 @@ func TestGotdDownloadSessionOpenRangePropagatesDocumentDCAndClientID(t *testing.
 		}
 		targetUploadCalls.Add(1)
 		end := min(req.Offset+int64(req.Limit), int64(len(wantPayload)))
-		return encodeTLResponse(&tg.UploadFile{
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{
 			Type:  &tg.StorageFilePartial{},
 			Bytes: wantPayload[req.Offset:end],
-		}, output)
+		}
+		return nil
 	}}
 	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
 		if dc != 4 {

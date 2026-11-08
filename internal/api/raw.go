@@ -147,6 +147,19 @@ func (h *RawHandler) streamFile(ctx context.Context, w http.ResponseWriter, user
 	}
 	defer download.Reader.Close()
 
+	var first []byte
+	if rangeSpec.Length > 0 {
+		buf := make([]byte, min(rangeSpec.Length, int64(32*1024)))
+		n, err := download.Reader.Read(buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return mapServiceError(err)
+		}
+		if n == 0 {
+			return mapServiceError(io.ErrUnexpectedEOF)
+		}
+		first = buf[:n]
+	}
+
 	status := http.StatusOK
 	if partial {
 		status = http.StatusPartialContent
@@ -160,11 +173,16 @@ func (h *RawHandler) streamFile(ctx context.Context, w http.ResponseWriter, user
 	w.Header().Set("Last-Modified", file.ModTime.Time.UTC().Format(http.TimeFormat))
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(status)
-	_, err = io.CopyN(w, download.Reader, rangeSpec.Length)
-	if err != nil && !isExpectedStreamEnd(ctx, err) {
-		// Headers are already committed, so a JSON error response cannot replace
-		// this stream. The Content-Length mismatch tells the client it was truncated.
-		slog.ErrorContext(ctx, "api.stream_failed", "file_id", fileID, "offset", rangeSpec.Offset, "length", rangeSpec.Length, "error", err)
+	if len(first) > 0 {
+		written, err := w.Write(first)
+		if err == nil && int64(written) < rangeSpec.Length {
+			_, err = io.CopyN(w, download.Reader, rangeSpec.Length-int64(written))
+		}
+		if err != nil && !isExpectedStreamEnd(ctx, err) {
+			// Headers are already committed, so a JSON error response cannot replace
+			// this stream. The Content-Length mismatch tells the client it was truncated.
+			slog.ErrorContext(ctx, "api.stream_failed", "file_id", fileID, "offset", rangeSpec.Offset, "length", rangeSpec.Length, "error", err)
+		}
 	}
 	return nil
 }
