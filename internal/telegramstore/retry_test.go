@@ -160,3 +160,75 @@ func TestRetryMiddlewareRetriesConnectionResetByPeer(t *testing.T) {
 		t.Fatalf("calls = %d, want 2", got)
 	}
 }
+
+func TestRetryMiddlewarePreservesRPCTimeoutAcrossDeadline(t *testing.T) {
+	t.Run("expires_during_backoff", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			invoke := (retryMiddleware{max: 5}).Handle(telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+				return tgerr.New(-503, "Timeout")
+			}))
+			err := invoke(ctx, nil, nil)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("invoke() error = %v, want context.DeadlineExceeded", err)
+			}
+			rpcErr, ok := tgerr.As(err)
+			if !ok || rpcErr.Code != -503 {
+				t.Fatalf("tgerr.As(%v) = (%v, %v), want -503 Timeout", err, rpcErr, ok)
+			}
+			if isPoolTimeout(err) {
+				t.Fatalf("isPoolTimeout(%v) = true, want false for server RPC timeout", err)
+			}
+		})
+	})
+
+	t.Run("expires_during_subsequent_attempt", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+			defer cancel()
+
+			var calls int
+			invoke := (retryMiddleware{max: 5}).Handle(telegram.InvokeFunc(func(callCtx context.Context, _ bin.Encoder, _ bin.Decoder) error {
+				calls++
+				if calls == 1 {
+					return tgerr.New(-503, "Timeout")
+				}
+				<-callCtx.Done()
+				return callCtx.Err()
+			}))
+			err := invoke(ctx, nil, nil)
+			if calls != 2 {
+				t.Fatalf("calls = %d, want 2", calls)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("invoke() error = %v, want context.DeadlineExceeded", err)
+			}
+			rpcErr, ok := tgerr.As(err)
+			if !ok || rpcErr.Code != -503 {
+				t.Fatalf("tgerr.As(%v) = (%v, %v), want -503 Timeout", err, rpcErr, ok)
+			}
+			if isPoolTimeout(err) {
+				t.Fatalf("isPoolTimeout(%v) = true, want false when prior attempt got RPC error", err)
+			}
+		})
+	})
+
+	t.Run("pre_expired_context_not_pool_timeout", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 0)
+		defer cancel()
+
+		invoke := (retryMiddleware{max: 3}).Handle(telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+			t.Fatal("unexpected call with expired context")
+			return nil
+		}))
+		err := invoke(ctx, nil, nil)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("invoke() error = %v, want context.DeadlineExceeded", err)
+		}
+		if isPoolTimeout(err) {
+			t.Fatalf("isPoolTimeout(%v) = true, want false when caller deadline expired before transport", err)
+		}
+	})
+}

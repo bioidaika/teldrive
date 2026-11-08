@@ -551,7 +551,7 @@ func (r *telegramRangeReader) fillDocument(ctx context.Context, api *tg.Client, 
 					err = fetchCtx.Err()
 					break
 				}
-				if !errors.Is(err, context.DeadlineExceeded) && !isTransientTelegramError(err) {
+				if !isRetryableChunkDownloadError(err) {
 					break
 				}
 			}
@@ -608,6 +608,12 @@ func (r *telegramRangeReader) fillDocument(ctx context.Context, api *tg.Client, 
 		}
 	}
 	return nil
+}
+
+func isRetryableChunkDownloadError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errMigratingPoolClosed) ||
+		isTransientTelegramError(err)
 }
 
 func planTelegramReads(offset, remaining int64, count int) []telegramReadPlan {

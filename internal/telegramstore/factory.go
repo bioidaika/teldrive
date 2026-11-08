@@ -318,12 +318,12 @@ func newShieldedDCPool(inner telegram.CloseInvoker, size int) *shieldedDCPool {
 
 func (s *shieldedDCPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return markNonPoolTimeout(err)
 	}
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return markNonPoolTimeout(ctx.Err())
 	case <-s.closeCtx.Done():
 		return errMigratingPoolClosed
 	}

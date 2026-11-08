@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
@@ -481,5 +482,196 @@ func TestMigratingPoolReroutesStaleDocumentDCHint(t *testing.T) {
 	}
 	if dc2Calls.Load() != 1 || dc4Calls.Load() != 2 {
 		t.Fatalf("dc2Calls=%d dc4Calls=%d, want 1 and 2", dc2Calls.Load(), dc4Calls.Load())
+	}
+}
+
+func TestMigratingPoolDoesNotResetPoolOnServerRPCTimeout(t *testing.T) {
+	siblingStarted := make(chan struct{})
+	var startOnce sync.Once
+	releaseSibling := make(chan struct{})
+	innerHome := &testDCPool{InvokeFunc: func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		req := input.(*tg.UploadGetFileRequest)
+		if req.Offset == 0 {
+			return tgerr.New(-503, "Timeout")
+		}
+		startOnce.Do(func() { close(siblingStarted) })
+		select {
+		case <-releaseSibling:
+			output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{1}}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
+	home := newShieldedDCPool(innerHome, 2)
+	router := newMigratingPool(home, func(context.Context, int) (telegram.CloseInvoker, error) {
+		t.Fatal("unexpected target DC open")
+		return nil, nil
+	}, func(invoker tg.Invoker) tg.Invoker {
+		return (retryMiddleware{max: 5}).Handle(invoker)
+	})
+	var homeOpens atomic.Int32
+	router.openHome = func() (telegram.CloseInvoker, error) {
+		homeOpens.Add(1)
+		return newShieldedDCPool(innerHome, 2), nil
+	}
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{ID: 321, AccessHash: 654, FileReference: []byte{1}}
+	siblingErrCh := make(chan error, 1)
+	go func() {
+		var out tg.UploadFileBox
+		siblingErrCh <- router.Invoke(withDocumentDC(context.Background(), 5), &tg.UploadGetFileRequest{Location: loc, Offset: 1}, &out)
+	}()
+	<-siblingStarted
+
+	slowCtx, cancelSlow := context.WithTimeout(withDocumentDC(context.Background(), 5), 25*time.Millisecond)
+	defer cancelSlow()
+	var slowOut tg.UploadFileBox
+	slowErr := router.Invoke(slowCtx, &tg.UploadGetFileRequest{Location: loc, Offset: 0}, &slowOut)
+	if !errors.Is(slowErr, context.DeadlineExceeded) {
+		t.Fatalf("slow Invoke() = %v, want context.DeadlineExceeded", slowErr)
+	}
+	if _, ok := tgerr.As(slowErr); !ok {
+		t.Fatalf("slow Invoke() = %v, want preserved tgerr.Error", slowErr)
+	}
+	if got := homeOpens.Load(); got != 0 {
+		t.Fatalf("homeOpens = %d, want 0 (server -503 Timeout must not reset pool)", got)
+	}
+
+	close(releaseSibling)
+	if err := <-siblingErrCh; err != nil {
+		t.Fatalf("sibling Invoke() = %v, want nil (in-flight sibling must not fail with pool closed)", err)
+	}
+}
+
+func TestMigratingPoolReplaysSiblingCallAcrossHomeReset(t *testing.T) {
+	siblingStarted := make(chan struct{})
+	var startOnce sync.Once
+	firstInner := &testDCPool{InvokeFunc: func(ctx context.Context, input bin.Encoder, _ bin.Decoder) error {
+		req := input.(*tg.UploadGetFileRequest)
+		if req.Offset == 0 {
+			return context.DeadlineExceeded
+		}
+		startOnce.Do(func() { close(siblingStarted) })
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	secondInner := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, output bin.Decoder) error {
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{42}}
+		return nil
+	}}
+	firstHome := newShieldedDCPool(firstInner, 2)
+	router := newMigratingPool(firstHome, func(context.Context, int) (telegram.CloseInvoker, error) {
+		t.Fatal("unexpected target DC open")
+		return nil, nil
+	}, unwrappedPool)
+	router.openHome = func() (telegram.CloseInvoker, error) {
+		return newShieldedDCPool(secondInner, 2), nil
+	}
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{ID: 999, AccessHash: 111, FileReference: []byte{2}}
+	siblingErrCh := make(chan error, 1)
+	var siblingOut tg.UploadFileBox
+	go func() {
+		siblingErrCh <- router.Invoke(withDocumentDC(context.Background(), 5), &tg.UploadGetFileRequest{Location: loc, Offset: 1}, &siblingOut)
+	}()
+	<-siblingStarted
+
+	var timedOut tg.UploadFileBox
+	if err := router.Invoke(withDocumentDC(context.Background(), 5), &tg.UploadGetFileRequest{Location: loc, Offset: 0}, &timedOut); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timed-out Invoke() = %v, want context.DeadlineExceeded", err)
+	}
+	if err := <-siblingErrCh; err != nil {
+		t.Fatalf("sibling Invoke() = %v, want replay on replacement pool without error", err)
+	}
+	if got := siblingOut.File.(*tg.UploadFile).Bytes; len(got) != 1 || got[0] != 42 {
+		t.Fatalf("sibling payload = %v, want [42]", got)
+	}
+}
+
+func TestShieldedDCPoolSemaphoreQueueTimeoutIsNotPoolTimeout(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	inner := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, _ bin.Decoder) error {
+		close(started)
+		<-release
+		return nil
+	}}
+	pool := newShieldedDCPool(inner, 1)
+	defer pool.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- pool.Invoke(context.Background(), nil, nil) }()
+	<-started
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := pool.Invoke(waitCtx, nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued waiter Invoke() = %v, want context.DeadlineExceeded", err)
+	}
+	if isPoolTimeout(err) {
+		t.Fatalf("isPoolTimeout(%v) = true, want false for semaphore queue timeout", err)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("active Invoke() = %v", err)
+	}
+}
+
+func TestMigratingPoolReplaysSiblingCallAcrossTargetEviction(t *testing.T) {
+	siblingStarted := make(chan struct{})
+	var startOnce sync.Once
+	firstTargetInner := &testDCPool{InvokeFunc: func(ctx context.Context, input bin.Encoder, _ bin.Decoder) error {
+		req := input.(*tg.UploadGetFileRequest)
+		if req.Offset == 0 {
+			return context.DeadlineExceeded
+		}
+		startOnce.Do(func() { close(siblingStarted) })
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	secondTargetInner := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, output bin.Decoder) error {
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{77}}
+		return nil
+	}}
+	var opens atomic.Int32
+	router := newMigratingPool(&testDCPool{InvokeFunc: func(context.Context, bin.Encoder, bin.Decoder) error {
+		t.Fatal("unexpected home call")
+		return nil
+	}}, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		if dc != 4 {
+			return nil, fmt.Errorf("unexpected target DC %d", dc)
+		}
+		if opens.Add(1) == 1 {
+			return newShieldedDCPool(firstTargetInner, 2), nil
+		}
+		return newShieldedDCPool(secondTargetInner, 2), nil
+	}, unwrappedPool)
+	router.homeDC = func() int { return 5 }
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{ID: 808, AccessHash: 909, FileReference: []byte{3}}
+	siblingErrCh := make(chan error, 1)
+	var siblingOut tg.UploadFileBox
+	go func() {
+		siblingErrCh <- router.Invoke(withDocumentDC(context.Background(), 4), &tg.UploadGetFileRequest{Location: loc, Offset: 1}, &siblingOut)
+	}()
+	<-siblingStarted
+
+	var timedOut tg.UploadFileBox
+	if err := router.Invoke(withDocumentDC(context.Background(), 4), &tg.UploadGetFileRequest{Location: loc, Offset: 0}, &timedOut); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timed-out Invoke() = %v, want context.DeadlineExceeded", err)
+	}
+	if err := <-siblingErrCh; err != nil {
+		t.Fatalf("sibling target Invoke() = %v, want replay on reopened target pool", err)
+	}
+	if got := siblingOut.File.(*tg.UploadFile).Bytes; len(got) != 1 || got[0] != 77 {
+		t.Fatalf("sibling target payload = %v, want [77]", got)
 	}
 }

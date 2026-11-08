@@ -128,7 +128,7 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 				p.mu.Unlock()
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return markNonPoolTimeout(ctx.Err())
 				case <-waitCh:
 				}
 				continue
@@ -160,10 +160,10 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 	}
 	defer finishProbe(0, false)
 
-	err := api.Invoke(ctx, input, output)
-	if errors.Is(err, context.DeadlineExceeded) {
+	usedHome, err := p.invokeCurrentHome(ctx, home, api, input, output)
+	if isPoolTimeout(err) {
 		finishProbe(0, false)
-		p.resetHome(home)
+		p.resetHome(usedHome)
 		return err
 	}
 	if err == nil {
@@ -176,6 +176,24 @@ func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bi
 	}
 	finishProbe(rpcErr.Argument, true)
 	return p.invokeSub(ctx, rpcErr.Argument, input, output)
+}
+
+func (p *migratingPool) invokeCurrentHome(ctx context.Context, home telegram.CloseInvoker, api tg.Invoker, input bin.Encoder, output bin.Decoder) (telegram.CloseInvoker, error) {
+	for attempt := range 2 {
+		err := api.Invoke(ctx, input, output)
+		if attempt == 0 && errors.Is(err, errMigratingPoolClosed) && ctx.Err() == nil {
+			p.mu.Lock()
+			if !p.closed && p.home != home {
+				home = p.home
+				api = p.api
+				p.mu.Unlock()
+				continue
+			}
+			p.mu.Unlock()
+		}
+		return home, err
+	}
+	return home, errMigratingPoolClosed
 }
 
 func (p *migratingPool) recordFileDC(docID int64, dc int) {
@@ -220,25 +238,38 @@ func (p *migratingPool) invokeHomeOnly(ctx context.Context, input bin.Encoder, o
 	home := p.home
 	api := p.api
 	p.mu.Unlock()
-	err := api.Invoke(ctx, input, output)
-	if errors.Is(err, context.DeadlineExceeded) {
-		p.resetHome(home)
+	usedHome, err := p.invokeCurrentHome(ctx, home, api, input, output)
+	if isPoolTimeout(err) {
+		p.resetHome(usedHome)
 	}
 	return err
 }
 
 func (p *migratingPool) invokeSub(ctx context.Context, dc int, input bin.Encoder, output bin.Decoder) error {
-	entry, openErr := p.target(ctx, dc)
-	if openErr != nil {
-		return fmt.Errorf("open Telegram target DC %d: %w", dc, openErr)
+	for attempt := range 2 {
+		entry, openErr := p.target(ctx, dc)
+		if openErr != nil {
+			return fmt.Errorf("open Telegram target DC %d: %w", dc, openErr)
+		}
+		// Like gotd's invokeSub, invoke directly on the authorized target rather
+		// than recursively redirecting or changing the primary session.
+		err := entry.api.Invoke(ctx, input, output)
+		if isPoolTimeout(err) {
+			p.evictTarget(dc, entry)
+			return err
+		}
+		if attempt == 0 && errors.Is(err, errMigratingPoolClosed) && ctx.Err() == nil && p.isTargetEvicted(dc, entry) {
+			continue
+		}
+		return err
 	}
-	// Like gotd's invokeSub, invoke directly on the authorized target rather
-	// than recursively redirecting or changing the primary session.
-	err := entry.api.Invoke(ctx, input, output)
-	if errors.Is(err, context.DeadlineExceeded) {
-		p.evictTarget(dc, entry)
-	}
-	return err
+	return errMigratingPoolClosed
+}
+
+func (p *migratingPool) isTargetEvicted(dc int, entry *dcPoolEntry) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.closed && p.pools[dc] != entry
 }
 
 func (p *migratingPool) target(ctx context.Context, dc int) (*dcPoolEntry, error) {
@@ -251,7 +282,7 @@ func (p *migratingPool) target(ctx context.Context, dc int) (*dcPoolEntry, error
 		p.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, markNonPoolTimeout(ctx.Err())
 		case <-entry.ready:
 			return entry, entry.err
 		}

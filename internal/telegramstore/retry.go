@@ -32,27 +32,68 @@ var transientTelegramMessages = []string{
 	"connection reset by peer",
 }
 
+var errNonPoolTimeout = errors.New("caller deadline expired before pool transport")
+
+type nonPoolTimeoutError struct {
+	err error
+}
+
+func (e nonPoolTimeoutError) Error() string { return e.err.Error() }
+
+func (e nonPoolTimeoutError) Unwrap() error { return e.err }
+
+func (e nonPoolTimeoutError) Is(target error) bool { return target == errNonPoolTimeout }
+
+func markNonPoolTimeout(err error) error {
+	if err == nil || errors.Is(err, errNonPoolTimeout) {
+		return err
+	}
+	return nonPoolTimeoutError{err: err}
+}
+
+func isPoolTimeout(err error) bool {
+	if !errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errNonPoolTimeout) ||
+		errors.Is(err, errMigratingPoolClosed) {
+		return false
+	}
+	_, hasRPCErr := tgerr.As(err)
+	return !hasRPCErr
+}
+
+func joinRetryContextError(lastErr, ctxErr error) error {
+	if lastErr == nil || errors.Is(lastErr, ctxErr) || errors.Is(ctxErr, lastErr) {
+		return ctxErr
+	}
+	return fmt.Errorf("%w: %w", lastErr, ctxErr)
+}
+
 type retryMiddleware struct{ max int }
 
 func (m retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		var lastErr error
 		for attempt := 0; ; attempt++ {
 			if err := ctx.Err(); err != nil {
-				return err
+				if attempt == 0 {
+					return markNonPoolTimeout(err)
+				}
+				return joinRetryContextError(lastErr, err)
 			}
 			err := next.Invoke(ctx, input, output)
 			if err == nil {
 				return nil
 			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				if errors.Is(err, ctxErr) {
-					return err
+				if !errors.Is(err, ctxErr) {
+					return joinRetryContextError(lastErr, fmt.Errorf("%w: %w", err, ctxErr))
 				}
-				return fmt.Errorf("%w: %w", err, ctxErr)
+				return joinRetryContextError(lastErr, err)
 			}
 			if !isTransientTelegramError(err) {
 				return err
 			}
+			lastErr = err
 			clientID, _ := ClientID(ctx)
 			if attempt >= m.max {
 				slog.WarnContext(ctx, "telegram.rpc_retry_exhausted",
@@ -70,7 +111,7 @@ func (m retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return ctx.Err()
+				return joinRetryContextError(lastErr, ctx.Err())
 			case <-timer.C:
 			}
 		}

@@ -2,12 +2,14 @@ package telegramstore
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // accountLeaserStub leases accounts in rotation and runs a background client
@@ -322,6 +324,43 @@ func TestDownloadClientPoolEvictsWarmClientOnStreamTimeout(t *testing.T) {
 	}
 	if got := runner.runs.Load(); got != 2 {
 		t.Fatalf("runner starts = %d, want 2", got)
+	}
+	_ = second.Close()
+	closeDownloadClientPool(t, pool)
+}
+
+func TestDownloadClientPoolKeepsWarmClientOnServerRPCTimeout(t *testing.T) {
+	runner := newAccountLeaserStub(1)
+	pool := newTestDownloadClientPool(t, runner, DownloadClientPoolConfig{})
+
+	first, err := pool.OpenDownloadSession(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSession := first.(*gotdDownloadSession)
+	firstClient, err := firstSession.client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpcTimeoutErr := fmt.Errorf("download chunk: %w: %w", tgerr.New(-503, "Timeout"), context.DeadlineExceeded)
+	firstSession.reportError(context.Background(), rpcTimeoutErr)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := pool.OpenDownloadSession(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondClient, err := second.(*gotdDownloadSession).client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondClient != firstClient {
+		t.Fatal("warm client was evicted on server -503 RPC timeout")
+	}
+	if got := runner.runs.Load(); got != 1 {
+		t.Fatalf("runner starts = %d, want 1", got)
 	}
 	_ = second.Close()
 	closeDownloadClientPool(t, pool)

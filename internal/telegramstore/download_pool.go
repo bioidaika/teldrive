@@ -228,7 +228,7 @@ func (p *DownloadClientPool) release(entry *downloadClientEntry) {
 }
 
 func (p *DownloadClientPool) evictOnTimeout(callCtx context.Context, entry *downloadClientEntry, err error) {
-	if callCtx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+	if callCtx.Err() == nil && isPoolTimeout(err) {
 		p.evict(entry)
 	}
 }

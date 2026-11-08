@@ -198,6 +198,31 @@ func TestTelegramRangeReaderRetriesRPCTimeout(t *testing.T) {
 	}
 }
 
+func TestTelegramRangeReaderRetriesClosedPoolError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	invoker := telegram.InvokeFunc(func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+		req := input.(*tg.UploadGetFileRequest)
+		if calls.Add(1) == 1 {
+			return errMigratingPoolClosed
+		}
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: make([]byte, req.Limit)}
+		return nil
+	})
+	api := tg.NewClient(invoker)
+	reader := newTelegramRangeReader(ctx, cancel, 2, 1)
+	reader.attempts = 2
+
+	if err := reader.fill(ctx, api, &tg.InputDocumentFileLocation{}, 0, telegramReadAlign, nil); err != nil {
+		t.Fatalf("fill() error = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("download calls = %d, want 2", got)
+	}
+}
+
 func TestTelegramRangeReaderRefreshesExpiredFileReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
