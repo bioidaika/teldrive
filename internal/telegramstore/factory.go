@@ -17,6 +17,7 @@ import (
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/log"
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/clock"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
@@ -123,7 +124,7 @@ func newFactory(config FactoryConfig, newNTP func(...string) (clock.Clock, error
 	return &Factory{
 		config: config, resolver: resolver,
 		clock:      clientClock,
-		middleware: []telegram.Middleware{floodwait.NewSimpleWaiter(), retry},
+		middleware: []telegram.Middleware{floodwait.NewSimpleWaiter().WithMaxWait(20 * time.Second).WithMaxRetries(3), retry},
 		limiters:   make(map[int64]*ratelimit.RateLimiter),
 		transfers:  make(map[int64]*semaphore.Weighted),
 	}, nil
@@ -242,7 +243,111 @@ func (f *Factory) PooledAPI(client *telegram.Client, accountID int64, size int) 
 	if f == nil || client == nil || accountID <= 0 || size < 1 {
 		return nil, nil, ErrTelegramConfiguration
 	}
-	return f.pooledAPI(client, accountID, size)
+	return f.pooledAPI(&realDCPoolClient{client: client}, accountID, 1)
+}
+
+type realDCPoolClient struct {
+	client *telegram.Client
+}
+
+func (c *realDCPoolClient) Pool(max int64) (telegram.CloseInvoker, error) {
+	p, err := c.client.Pool(1)
+	if err != nil {
+		return nil, err
+	}
+	return newShieldedDCPool(p), nil
+}
+
+func (c *realDCPoolClient) DC(ctx context.Context, dc int, max int64) (telegram.CloseInvoker, error) {
+	openCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	p, err := c.client.DC(openCtx, dc, 1)
+	if err != nil {
+		return nil, err
+	}
+	return newShieldedDCPool(p), nil
+}
+
+// shieldedDCPool serializes access to a single-connection gotd *pool.DC and
+// shields in-flight RPCs and connection initialization from caller
+// context.Canceled. In gotd/td/pool, cancelling ctx while acquire() is waiting
+// on <-conn.Ready() leaks c.total permanently, and cancelling ctx while an RPC
+// is on the wire triggers a synchronous 15s RPCDropAnswerRequest before
+// releasing the connection back to the pool.
+type shieldedDCPool struct {
+	inner    telegram.CloseInvoker
+	sem      chan struct{}
+	closeCtx context.Context
+	cancel   context.CancelFunc
+	closeOne sync.Once
+}
+
+func newShieldedDCPool(inner telegram.CloseInvoker) *shieldedDCPool {
+	closeCtx, cancel := context.WithCancel(context.Background())
+	return &shieldedDCPool{
+		inner:    inner,
+		sem:      make(chan struct{}, 1),
+		closeCtx: closeCtx,
+		cancel:   cancel,
+	}
+}
+
+func (s *shieldedDCPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCtx.Done():
+		return errMigratingPoolClosed
+	}
+
+	var rpcCtx context.Context
+	var rpcCancel context.CancelFunc
+	baseCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		rpcCtx, rpcCancel = context.WithDeadline(baseCtx, deadline)
+	} else {
+		rpcCtx, rpcCancel = context.WithTimeout(baseCtx, 30*time.Second)
+	}
+	stopAfterClose := context.AfterFunc(s.closeCtx, rpcCancel)
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			stopAfterClose()
+			rpcCancel()
+			<-s.sem
+		}()
+		done <- s.inner.Invoke(rpcCtx, input, output)
+	}()
+
+	select {
+	case err := <-done:
+		if ctxErr := ctx.Err(); ctxErr != nil && err != nil {
+			if errors.Is(err, ctxErr) {
+				return err
+			}
+			return fmt.Errorf("%w: %w", err, ctxErr)
+		}
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCtx.Done():
+		return errMigratingPoolClosed
+	}
+}
+
+func (s *shieldedDCPool) Close() error {
+	s.closeOne.Do(func() {
+		s.cancel()
+		go func() {
+			_ = s.inner.Close()
+		}()
+	})
+	return nil
 }
 
 func (f *Factory) pooledAPI(client dcPoolClient, accountID int64, size int) (*tg.Client, func() error, error) {
@@ -398,16 +503,20 @@ func (p *DatabaseClientProvider) Client(ctx context.Context, userID int64, _ Ope
 }
 
 type databaseSessionStorage struct {
+	mu        sync.Mutex
 	queries   *sqlcgen.Queries
 	cipher    *secureblob.Cipher
 	sessionID pgtype.UUID
 	userID    int64
+	encoded   string
 }
 
 func (s *databaseSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
 	if s == nil || s.queries == nil || s.cipher == nil || s.userID <= 0 || !s.sessionID.Valid {
 		return nil, ErrTelegramConfiguration
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	row, err := s.queries.GetActiveSession(ctx, sqlcgen.GetActiveSessionParams{
 		SessionID: s.sessionID, UserID: s.userID,
 	})
@@ -418,10 +527,12 @@ func (s *databaseSessionStorage) LoadSession(ctx context.Context) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("decrypt Telegram session: %w", err)
 	}
-	raw, err := telethonsession.DecodeToGotd(ctx, string(plain))
+	encoded := string(plain)
+	raw, err := telethonsession.DecodeToGotd(ctx, encoded)
 	if err != nil {
 		return nil, fmt.Errorf("load Telethon Telegram session: %w", err)
 	}
+	s.encoded = encoded
 	return raw, nil
 }
 
@@ -432,6 +543,11 @@ func (s *databaseSessionStorage) StoreSession(ctx context.Context, data []byte) 
 	encoded, err := telethonsession.EncodeGotd(ctx, data)
 	if err != nil {
 		return fmt.Errorf("encode Telegram session update as Telethon: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if encoded == s.encoded && s.encoded != "" {
+		return nil
 	}
 	ciphertext, err := s.cipher.Seal("telegram-session", []byte(encoded))
 	if err != nil {
@@ -446,6 +562,7 @@ func (s *databaseSessionStorage) StoreSession(ctx context.Context, data []byte) 
 	if count == 0 {
 		return ErrClientUnavailable
 	}
+	s.encoded = encoded
 	return nil
 }
 

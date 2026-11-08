@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/gotd/td/session"
 
@@ -16,26 +17,47 @@ import (
 const telethonSessionVersion byte = '1'
 
 type botSessionStorage struct {
+	mu      sync.Mutex
 	queries *sqlcgen.Queries
 	cipher  *secureblob.Cipher
 	userID  int64
 	botID   int64
 	stored  []byte
+	encoded string
 }
 
 func (s *botSessionStorage) HasSession() bool {
-	return s != nil && len(s.stored) > 0
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.stored) > 0
 }
 
 func (s *botSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
-	if !s.HasSession() {
+	if s == nil {
 		return nil, session.ErrNotFound
 	}
-	plain, err := s.cipher.Open("bot-session", s.stored)
+	s.mu.Lock()
+	if len(s.stored) == 0 {
+		s.mu.Unlock()
+		return nil, session.ErrNotFound
+	}
+	stored := append([]byte(nil), s.stored...)
+	s.mu.Unlock()
+
+	plain, err := s.cipher.Open("bot-session", stored)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt bot session: %w", err)
 	}
-	return telethonsession.DecodeToGotd(ctx, string(plain))
+	encoded := string(plain)
+	s.mu.Lock()
+	if s.encoded == "" {
+		s.encoded = encoded
+	}
+	s.mu.Unlock()
+	return telethonsession.DecodeToGotd(ctx, encoded)
 }
 
 func (s *botSessionStorage) StoreSession(ctx context.Context, raw []byte) error {
@@ -45,6 +67,11 @@ func (s *botSessionStorage) StoreSession(ctx context.Context, raw []byte) error 
 	encoded, err := telethonsession.EncodeGotd(ctx, raw)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if encoded == s.encoded && len(s.stored) > 0 {
+		return nil
 	}
 	ciphertext, err := s.cipher.Seal("bot-session", []byte(encoded))
 	if err != nil {
@@ -61,6 +88,7 @@ func (s *botSessionStorage) StoreSession(ctx context.Context, raw []byte) error 
 	if count == 0 {
 		return errors.New("bot session row no longer exists")
 	}
-	s.stored = append(s.stored[:0], ciphertext...)
+	s.stored = append([]byte(nil), ciphertext...)
+	s.encoded = encoded
 	return nil
 }

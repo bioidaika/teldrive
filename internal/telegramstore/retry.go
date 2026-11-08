@@ -2,6 +2,7 @@ package telegramstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -43,8 +44,11 @@ func (m retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 			if err == nil {
 				return nil
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if errors.Is(err, ctxErr) {
+					return err
+				}
+				return fmt.Errorf("%w: %w", err, ctxErr)
 			}
 			if !isTransientTelegramError(err) {
 				return err

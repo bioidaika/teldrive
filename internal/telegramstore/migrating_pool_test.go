@@ -221,3 +221,92 @@ func TestMigratingPoolResetsTimedOutHomePool(t *testing.T) {
 		t.Fatalf("second Invoke() = %v, want nil", err)
 	}
 }
+
+func TestMigratingPoolCachesRealDocumentDCAndDeduplicatesInitialProbe(t *testing.T) {
+	var homeCalls, targetCalls atomic.Int32
+	home := &testDCPool{InvokeFunc: func(_ context.Context, _ bin.Encoder, _ bin.Decoder) error {
+		homeCalls.Add(1)
+		return tgerr.New(303, "FILE_MIGRATE_4")
+	}}
+	target := &testDCPool{InvokeFunc: func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+		targetCalls.Add(1)
+		req := input.(*tg.UploadGetFileRequest)
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Bytes: []byte{byte(req.Offset)}}
+		return nil
+	}}
+	router := newMigratingPool(home, func(_ context.Context, dc int) (telegram.CloseInvoker, error) {
+		if dc != 4 {
+			return nil, fmt.Errorf("unexpected DC %d", dc)
+		}
+		return target, nil
+	}, unwrappedPool)
+	defer router.Close()
+
+	loc := &tg.InputDocumentFileLocation{
+		ID:            999,
+		AccessHash:    12345,
+		FileReference: []byte{1, 2, 3},
+	}
+	var wg sync.WaitGroup
+	for n := range 8 {
+		wg.Go(func() {
+			var out tg.UploadFileBox
+			if err := router.Invoke(context.Background(), &tg.UploadGetFileRequest{Location: loc, Offset: int64(n)}, &out); err != nil {
+				t.Errorf("Invoke(%d) = %v", n, err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := homeCalls.Load(); got != 1 {
+		t.Fatalf("homeCalls = %d, want 1", got)
+	}
+	if got := targetCalls.Load(); got != 8 {
+		t.Fatalf("targetCalls = %d, want 8", got)
+	}
+}
+
+func TestShieldedDCPoolDetachesCancelAndAbortsQueuedWaiters(t *testing.T) {
+	inFlightStarted := make(chan struct{})
+	releaseInFlight := make(chan struct{})
+	inFlightDone := make(chan error, 1)
+	var innerCalls atomic.Int32
+
+	inner := &testDCPool{InvokeFunc: func(ctx context.Context, _ bin.Encoder, _ bin.Decoder) error {
+		if innerCalls.Add(1) == 1 {
+			close(inFlightStarted)
+			<-releaseInFlight
+			inFlightDone <- ctx.Err()
+			return ctx.Err()
+		}
+		return nil
+	}}
+	pool := newShieldedDCPool(inner)
+	defer pool.Close()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	err1Ch := make(chan error, 1)
+	go func() {
+		err1Ch <- pool.Invoke(ctx1, nil, nil)
+	}()
+	<-inFlightStarted
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if err := pool.Invoke(ctx2, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued cancelled caller = %v, want context.Canceled", err)
+	}
+
+	cancel1()
+	if err := <-err1Ch; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled active caller = %v, want context.Canceled", err)
+	}
+
+	close(releaseInFlight)
+	if innerErr := <-inFlightDone; innerErr != nil {
+		t.Fatalf("inner RPC saw cancellation %v, want nil (detached from context.Canceled)", innerErr)
+	}
+	if got := innerCalls.Load(); got != 1 {
+		t.Fatalf("innerCalls = %d, want 1", got)
+	}
+}

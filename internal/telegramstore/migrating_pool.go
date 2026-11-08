@@ -33,31 +33,101 @@ type migratingPool struct {
 	wrap     func(tg.Invoker) tg.Invoker
 	mu       sync.Mutex
 	pools    map[int]*dcPoolEntry
+	fileDCs  map[int64]int
+	probing  map[int64]chan struct{}
 	closed   bool
 }
 
 func newMigratingPool(home telegram.CloseInvoker, open func(context.Context, int) (telegram.CloseInvoker, error), wrap func(tg.Invoker) tg.Invoker) *migratingPool {
-	return &migratingPool{home: home, api: wrap(home), open: open, wrap: wrap, pools: make(map[int]*dcPoolEntry)}
+	return &migratingPool{
+		home:    home,
+		api:     wrap(home),
+		open:    open,
+		wrap:    wrap,
+		pools:   make(map[int]*dcPoolEntry),
+		fileDCs: make(map[int64]int),
+		probing: make(map[int64]chan struct{}),
+	}
+}
+
+func cacheableDocumentID(input bin.Encoder) (int64, bool) {
+	req, ok := input.(*tg.UploadGetFileRequest)
+	if !ok || req == nil {
+		return 0, false
+	}
+	loc, ok := req.Location.(*tg.InputDocumentFileLocation)
+	if !ok || loc == nil || loc.ID == 0 || (loc.AccessHash == 0 && len(loc.FileReference) == 0) {
+		return 0, false
+	}
+	return loc.ID, true
 }
 
 func (p *migratingPool) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-	p.mu.Lock()
-	closed := p.closed
+	docID, cacheable := cacheableDocumentID(input)
+	var ownProbe chan struct{}
+
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return errMigratingPoolClosed
+		}
+		if cacheable {
+			if dc, ok := p.fileDCs[docID]; ok {
+				if dc > 0 {
+					p.mu.Unlock()
+					return p.invokeSub(ctx, dc, input, output)
+				}
+				break
+			}
+			if waitCh, ok := p.probing[docID]; ok {
+				p.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-waitCh:
+				}
+				continue
+			}
+			ownProbe = make(chan struct{})
+			p.probing[docID] = ownProbe
+		}
+		break
+	}
 	home := p.home
 	api := p.api
 	p.mu.Unlock()
-	if closed {
-		return errMigratingPoolClosed
+
+	finishProbe := func(dc int, ok bool) {
+		if ownProbe == nil {
+			return
+		}
+		p.mu.Lock()
+		if ok && !p.closed {
+			p.fileDCs[docID] = dc
+		}
+		delete(p.probing, docID)
+		close(ownProbe)
+		ownProbe = nil
+		p.mu.Unlock()
 	}
+	defer finishProbe(0, false)
+
 	err := api.Invoke(ctx, input, output)
 	if errors.Is(err, context.DeadlineExceeded) {
+		finishProbe(0, false)
 		p.resetHome(home)
 		return err
+	}
+	if err == nil {
+		finishProbe(0, true)
+		return nil
 	}
 	rpcErr, ok := tgerr.As(err)
 	if !ok || !rpcErr.IsOneOf("FILE_MIGRATE", "STATS_MIGRATE") || rpcErr.Argument <= 0 {
 		return err
 	}
+	finishProbe(rpcErr.Argument, true)
 	return p.invokeSub(ctx, rpcErr.Argument, input, output)
 }
 
@@ -127,6 +197,11 @@ func (p *migratingPool) resetHome(failed telegram.CloseInvoker) {
 	}
 	p.home = replacement
 	p.api = p.wrap(replacement)
+	for docID, cachedDC := range p.fileDCs {
+		if cachedDC == 0 {
+			delete(p.fileDCs, docID)
+		}
+	}
 	p.mu.Unlock()
 	if failed != nil {
 		_ = failed.Close()
@@ -143,6 +218,11 @@ func (p *migratingPool) evictTarget(dc int, failed *dcPoolEntry) {
 		return
 	}
 	delete(p.pools, dc)
+	for docID, cachedDC := range p.fileDCs {
+		if cachedDC == dc {
+			delete(p.fileDCs, docID)
+		}
+	}
 	p.mu.Unlock()
 	if failed.pool != nil {
 		_ = failed.pool.Close()
