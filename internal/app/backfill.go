@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/tgdrive/teldrive/v2/internal/contentcrypto"
 	"github.com/tgdrive/teldrive/v2/internal/database"
@@ -21,6 +23,30 @@ type partToBackfill struct {
 	MessageID  int64
 	UserID     int64
 	Encryption bool
+}
+
+func parseFloodWait(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	var rpc *tgerr.Error
+	if errors.As(err, &rpc) && rpc.Code == 420 && rpc.Argument > 0 {
+		return time.Duration(rpc.Argument) * time.Second
+	}
+	msg := err.Error()
+	if idx := strings.Index(msg, "FLOOD_WAIT ("); idx != -1 {
+		var sec int
+		if _, scanErr := fmt.Sscanf(msg[idx:], "FLOOD_WAIT (%d)", &sec); scanErr == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	if idx := strings.Index(msg, "flood wait argument is too big ("); idx != -1 {
+		var sec int
+		if _, scanErr := fmt.Sscanf(msg[idx:], "flood wait argument is too big (%ds", &sec); scanErr == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	return 0
 }
 
 // BackfillPartSizes resolves missing plain_size and stored_size for file parts from Telegram
@@ -68,31 +94,9 @@ func (a *App) BackfillPartSizes(ctx context.Context, batchSize int, delay time.D
 	var lastPartNo int32
 	hasCursor := false
 
-	var currentSession telegramstore.DownloadSession
-	var currentSessionUserID int64
-	defer func() {
-		if currentSession != nil {
-			_ = currentSession.Close()
-		}
-	}()
-
-	openUserSession := func(userID int64) (telegramstore.DownloadSession, error) {
-		if currentSession != nil && currentSessionUserID == userID {
-			return currentSession, nil
-		}
-		if currentSession != nil {
-			_ = currentSession.Close()
-			currentSession = nil
-			currentSessionUserID = 0
-		}
+	openSession := func(userID int64) (telegramstore.DownloadSession, error) {
 		if opener, ok := a.storage.(telegramstore.DownloadSessionOpener); ok {
-			session, err := opener.OpenDownloadSession(ctx, userID)
-			if err != nil {
-				return nil, err
-			}
-			currentSession = session
-			currentSessionUserID = userID
-			return session, nil
+			return opener.OpenDownloadSession(ctx, userID)
 		}
 		return nil, errors.New("storage does not support download sessions")
 	}
@@ -173,14 +177,6 @@ func (a *App) BackfillPartSizes(ctx context.Context, batchSize int, delay time.D
 				i++
 			}
 			chunk := batch[chunkStart:i]
-			processedTotal += int64(len(chunk))
-
-			session, err := openUserSession(userID)
-			if err != nil {
-				slog.Error("backfill.session_failed", "user_id", userID, "error", err)
-				skippedTotal += int64(len(chunk))
-				continue
-			}
 
 			messageIDs := make([]int64, len(chunk))
 			for idx, p := range chunk {
@@ -188,23 +184,61 @@ func (a *App) BackfillPartSizes(ctx context.Context, batchSize int, delay time.D
 			}
 
 			var sizes map[int64]int64
-			if batchResolver, ok := session.(telegramstore.BatchMetadataSession); ok {
-				sizes, err = batchResolver.BatchMetadata(ctx, channelID, messageIDs)
-			} else {
-				sizes = make(map[int64]int64, len(chunk))
-				for _, p := range chunk {
-					meta, mErr := session.Metadata(ctx, telegramstore.MetadataRequest{
-						UserID: p.UserID, ChannelID: p.ChannelID, MessageID: p.MessageID,
-					})
-					if mErr == nil {
-						sizes[p.MessageID] = meta.Size
-					}
+			var batchErr error
+			for attempt := 0; attempt < 5; attempt++ {
+				if ctx.Err() != nil {
+					batchErr = ctx.Err()
+					break
 				}
+				session, sErr := openSession(userID)
+				if sErr != nil {
+					batchErr = sErr
+					slog.Error("backfill.session_failed", "user_id", userID, "error", sErr)
+					time.Sleep(delay)
+					continue
+				}
+
+				if batchResolver, ok := session.(telegramstore.BatchMetadataSession); ok {
+					sizes, batchErr = batchResolver.BatchMetadata(ctx, channelID, messageIDs)
+				} else {
+					sizes = make(map[int64]int64, len(chunk))
+					for _, p := range chunk {
+						meta, mErr := session.Metadata(ctx, telegramstore.MetadataRequest{
+							UserID: p.UserID, ChannelID: p.ChannelID, MessageID: p.MessageID,
+						})
+						if mErr == nil {
+							sizes[p.MessageID] = meta.Size
+						}
+					}
+					batchErr = nil
+				}
+				_ = session.Close()
+
+				if batchErr == nil {
+					break
+				}
+
+				if wait := parseFloodWait(batchErr); wait > 0 {
+					wait += 2 * time.Second
+					slog.Warn("backfill.flood_wait", "wait", wait, "user_id", userID, "channel_id", channelID)
+					fmt.Printf("\n[Flood Wait] Telegram requested waiting %s. Sleeping before retrying...\n", wait.Round(time.Second))
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(wait):
+					}
+					continue
+				}
+
+				slog.Warn("backfill.batch_retry", "attempt", attempt+1, "user_id", userID, "channel_id", channelID, "error", batchErr)
+				time.Sleep(delay)
 			}
 
-			if err != nil {
-				slog.Warn("backfill.batch_failed", "user_id", userID, "channel_id", channelID, "error", err)
+			if batchErr != nil {
+				slog.Warn("backfill.batch_failed", "user_id", userID, "channel_id", channelID, "error", batchErr)
 				skippedTotal += int64(len(chunk))
+				processedTotal += int64(len(chunk))
+				time.Sleep(delay)
 				continue
 			}
 
@@ -240,11 +274,12 @@ func (a *App) BackfillPartSizes(ctx context.Context, batchSize int, delay time.D
 				}
 			}
 			updatedTotal += chunkUpdated
+			processedTotal += int64(len(chunk))
 
 			pct := float64(processedTotal) / float64(targetCount) * 100.0
 			elapsed := time.Since(startTime)
 			eta := time.Duration(0)
-			if processedTotal > 0 {
+			if processedTotal > 0 && processedTotal < targetCount {
 				eta = time.Duration(float64(elapsed) / float64(processedTotal) * float64(targetCount-processedTotal))
 			}
 			fmt.Printf("[%5.1f%%] Updated: %d | Skipped: %d | Processed: %d/%d | Elapsed: %s | ETA: %s\n",
