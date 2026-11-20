@@ -92,3 +92,5 @@ changelog:
 
 release:
   draft: false
+  prerelease: false
+  make_latest: true

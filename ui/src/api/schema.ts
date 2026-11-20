@@ -1525,6 +1525,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/periodic-jobs/{periodicJobId}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["runPeriodicJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/periodic-jobs/{periodicJobId}/pause": {
         parameters: {
             query?: never;
@@ -2498,6 +2514,8 @@ export interface components {
         RefreshCookie: string;
         "CursorQuery.cursor": components["schemas"]["Cursor"];
         "CursorQuery.limit": number;
+        "FileCursorQuery.cursor": components["schemas"]["Cursor"];
+        "FileCursorQuery.limit": number;
         "FileListQuery.scope": components["schemas"]["FileListScope"];
         "FileListQuery.parentId": components["schemas"]["Uuid"];
         /** @description Resolve the listing root relative to the user's drive root. */
@@ -2519,6 +2537,8 @@ export interface components {
         "FileContentRequestOptions.ifNoneMatch": components["schemas"]["ETag"];
         /** @description Force a browser download instead of inline display. */
         "FileContentRequestOptions.download": "1";
+        /** @description Alias for download=1. */
+        "FileContentRequestOptions.d": "1";
         "UploadPartHeaders.contentLength": number;
         /** @description BLAKE3 checksum of the plaintext part. */
         "UploadPartHeaders.checksum": components["schemas"]["Checksum"];
@@ -4513,8 +4533,8 @@ export interface operations {
     listFiles: {
         parameters: {
             query?: {
-                cursor?: components["parameters"]["CursorQuery.cursor"];
-                limit?: components["parameters"]["CursorQuery.limit"];
+                cursor?: components["parameters"]["FileCursorQuery.cursor"];
+                limit?: components["parameters"]["FileCursorQuery.limit"];
                 scope?: components["parameters"]["FileListQuery.scope"];
                 parentId?: components["parameters"]["FileListQuery.parentId"];
                 /** @description Resolve the listing root relative to the user's drive root. */
@@ -5096,6 +5116,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 Range?: components["parameters"]["FileContentRequestOptions.range"];
@@ -5241,6 +5263,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 Range?: components["parameters"]["FileContentRequestOptions.range"];
@@ -6921,8 +6945,8 @@ export interface operations {
     listPublicShareFiles: {
         parameters: {
             query?: {
-                cursor?: components["parameters"]["CursorQuery.cursor"];
-                limit?: components["parameters"]["CursorQuery.limit"];
+                cursor?: components["parameters"]["FileCursorQuery.cursor"];
+                limit?: components["parameters"]["FileCursorQuery.limit"];
                 /** @description Folder path relative to the shared folder root. */
                 path?: components["parameters"]["PublicShareListQuery.path"];
                 search?: components["parameters"]["PublicShareListQuery.search"];
@@ -7001,6 +7025,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 "X-Share-Password"?: components["parameters"]["SharePasswordHeader"];
@@ -7191,6 +7217,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 "X-Share-Password"?: components["parameters"]["SharePasswordHeader"];
@@ -7379,6 +7407,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 "X-Share-Password"?: components["parameters"]["SharePasswordHeader"];
@@ -7567,6 +7597,8 @@ export interface operations {
             query?: {
                 /** @description Force a browser download instead of inline display. */
                 download?: components["parameters"]["FileContentRequestOptions.download"];
+                /** @description Alias for download=1. */
+                d?: components["parameters"]["FileContentRequestOptions.d"];
             };
             header?: {
                 "X-Share-Password"?: components["parameters"]["SharePasswordHeader"];
@@ -8980,6 +9012,55 @@ export interface operations {
             };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    runPeriodicJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                periodicJobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request has succeeded and a new resource has been created as a result. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

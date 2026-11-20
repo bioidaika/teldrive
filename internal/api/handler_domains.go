@@ -193,7 +193,7 @@ func (h *Handler) ListApiKeys(ctx context.Context, params gen.ListApiKeysParams)
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(authn.ErrInvalidInput)
 	}
-	input := authn.ListAPIKeysInput{UserID: userID, Limit: params.Limit.Or(100)}
+	input := authn.ListAPIKeysInput{UserID: userID, Limit: params.Limit.Value}
 	if cursor.ID != uuid.Nil {
 		input.AfterID, input.AfterCreatedAt = &cursor.ID, &cursor.CreatedAt
 	}
@@ -236,7 +236,7 @@ func (h *Handler) ListSessions(ctx context.Context, params gen.ListSessionsParam
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(authn.ErrInvalidInput)
 	}
-	input := authn.ListSessionsInput{UserID: identity.UserID, Limit: params.Limit.Or(100)}
+	input := authn.ListSessionsInput{UserID: identity.UserID, Limit: params.Limit.Value}
 	if cursor.ID != uuid.Nil {
 		input.AfterID, input.AfterCreatedAt = &cursor.ID, &cursor.CreatedAt
 	}
@@ -340,7 +340,7 @@ func (h *Handler) ListBots(ctx context.Context, params gen.ListBotsParams) (gen.
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(bots.ErrInvalidInput)
 	}
-	input := bots.ListInput{UserID: userID, Limit: params.Limit.Or(100)}
+	input := bots.ListInput{UserID: userID, Limit: params.Limit.Value}
 	if cursor.ID != 0 {
 		input.AfterCreatedAt, input.AfterBotID = &cursor.CreatedAt, &cursor.ID
 	}
@@ -494,7 +494,7 @@ func (h *Handler) ListChannels(ctx context.Context, params gen.ListChannelsParam
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(channels.ErrInvalidChannel)
 	}
-	input := channels.ListInput{UserID: userID, Limit: params.Limit.Or(100)}
+	input := channels.ListInput{UserID: userID, Limit: params.Limit.Value}
 	if cursor.ID != 0 {
 		input.AfterCreatedAt, input.AfterChannelID = &cursor.CreatedAt, &cursor.ID
 	}
@@ -672,7 +672,7 @@ func (h *Handler) ListFileShares(ctx context.Context, params gen.ListFileSharesP
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(shares.ErrInvalidInput)
 	}
-	input := shares.ListInput{OwnerID: userID, FileID: googleUUID(params.FileId), Limit: params.Limit.Or(100)}
+	input := shares.ListInput{OwnerID: userID, FileID: googleUUID(params.FileId), Limit: params.Limit.Value}
 	if cursor.ID != uuid.Nil {
 		input.AfterCreatedAt, input.AfterID = &cursor.CreatedAt, &cursor.ID
 	}
@@ -751,7 +751,7 @@ func (h *Handler) HeadPublicShare(ctx context.Context, params gen.HeadPublicShar
 		return nil, mapServiceError(transfer.ErrInvalidDownload)
 	}
 	return &gen.HeadPublicShareOK{
-		AcceptRanges: gen.HeadPublicShareOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }
@@ -769,7 +769,7 @@ func (h *Handler) HeadPublicShareLegacy(ctx context.Context, params gen.HeadPubl
 		return nil, mapServiceError(transfer.ErrInvalidDownload)
 	}
 	return &gen.HeadPublicShareLegacyOK{
-		AcceptRanges: gen.HeadPublicShareLegacyOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }
@@ -788,7 +788,7 @@ func (h *Handler) HeadPublicShareFile(ctx context.Context, params gen.HeadPublic
 		return nil, mapServiceError(transfer.ErrInvalidDownload)
 	}
 	return &gen.HeadPublicShareFileOK{
-		AcceptRanges: gen.HeadPublicShareFileOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }
@@ -807,7 +807,7 @@ func (h *Handler) HeadPublicShareFileLegacy(ctx context.Context, params gen.Head
 		return nil, mapServiceError(transfer.ErrInvalidDownload)
 	}
 	return &gen.HeadPublicShareFileLegacyOK{
-		AcceptRanges: gen.HeadPublicShareFileLegacyOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }

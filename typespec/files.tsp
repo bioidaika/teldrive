@@ -257,6 +257,10 @@ model FileContentRequestOptions {
   /** Force a browser download instead of inline display. */
   @query
   download?: "1";
+
+  /** Alias for download=1. */
+  @query
+  d?: "1";
 }
 
 model FileContentResponse {
@@ -335,7 +339,7 @@ namespace Files {
   /** List one folder or search within the authenticated user's drive. */
   @get
   @operationId("listFiles")
-  op list(...CursorQuery, ...FileListQuery):
+  op list(...FileCursorQuery, ...FileListQuery):
     | JsonResponse<200, CursorPage<FileEntry>>
     | ErrorResponse<401>
     | ErrorResponse<404>

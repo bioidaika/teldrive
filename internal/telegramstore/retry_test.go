@@ -232,7 +232,6 @@ func TestRetryMiddlewarePreservesRPCTimeoutAcrossDeadline(t *testing.T) {
 		}
 	})
 }
-
 func TestRetryMiddlewareKeepsTelegramErrorWhenDeadlineEnds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		refusal := tgerr.New(-503, "Timeout")

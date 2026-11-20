@@ -111,7 +111,7 @@ func (h *Handler) ListFiles(ctx context.Context, params gen.ListFilesParams) (ge
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(uploads.ErrInvalidInput)
 	}
-	limit := params.Limit.Or(100)
+	limit := params.Limit.Value
 	scope := string(params.Scope.Or(gen.FileListQueryScopeFolder))
 	bookmarked := params.Bookmarked.Or(false)
 	if bookmarked {
@@ -453,7 +453,7 @@ func (h *Handler) ListUploads(ctx context.Context, params gen.ListUploadsParams)
 	if err := decodeCursor(params.Cursor, &cursor); err != nil {
 		return nil, mapServiceError(uploads.ErrInvalidInput)
 	}
-	input := uploads.ListInput{UserID: userID, Limit: params.Limit.Or(100)}
+	input := uploads.ListInput{UserID: userID, Limit: params.Limit.Value}
 	if value, ok := params.State.Get(); ok {
 		state := sqlcgen.UploadState(value)
 		input.State = &state
@@ -494,7 +494,7 @@ func (h *Handler) ListUploadParts(ctx context.Context, params gen.ListUploadPart
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	input := uploads.ListPartsInput{UserID: ownerID, UploadID: googleUUID(params.UploadId), Limit: params.Limit.Or(100)}
+	input := uploads.ListPartsInput{UserID: ownerID, UploadID: googleUUID(params.UploadId), Limit: params.Limit.Value}
 	if cursor.PartNo > 0 {
 		input.AfterPartNo = &cursor.PartNo
 	}
@@ -601,7 +601,7 @@ func (h *Handler) HeadFile(ctx context.Context, params gen.HeadFileParams) (gen.
 		return nil, mapServiceError(transfer.ErrInvalidDownload)
 	}
 	return &gen.HeadFileOK{
-		AcceptRanges: gen.HeadFileOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }
@@ -619,7 +619,7 @@ func (h *Handler) HeadFileLegacy(ctx context.Context, params gen.HeadFileLegacyP
 		return nil, mapServiceError(catalog.ErrNotFound)
 	}
 	return &gen.HeadFileLegacyOK{
-		AcceptRanges: gen.HeadFileLegacyOKAcceptRanges("bytes"), ContentDisposition: contentDisposition(file.Name, false),
+		AcceptRanges: "bytes", ContentDisposition: contentDisposition(file.Name, false),
 		ContentLength: file.Size.Int64, Etag: contentETag(file), LastModified: file.ModTime.Time,
 	}, nil
 }

@@ -89,6 +89,33 @@ test("Recent keeps modified time and folder location in list and grid views", as
   }
 });
 
+test("category dropdown supports multiple selections and removing categories", async ({ page }) => {
+  await installResults(page);
+  await page.goto("/search?q=alpha");
+  await page.getByRole("button", { name: "Filters", exact: true }).click();
+  const categories = page.getByRole("button", { name: /Categories/ });
+  await categories.click();
+  await page.getByRole("option", { name: "document", exact: true }).click();
+  await page.getByRole("option", { name: "image", exact: true }).click();
+  await expect(page.getByRole("option", { name: "document", exact: true })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await page.getByRole("listbox").press("Escape");
+  await page.getByRole("button", { name: "Apply filters" }).click();
+  await expect
+    .poll(() => JSON.parse(new URL(page.url()).searchParams.get("category") ?? "[]"))
+    .toEqual(["document", "image"]);
+
+  await page.getByRole("button", { name: "Filters", exact: true }).click();
+  await categories.click();
+  await page.getByRole("option", { name: "document", exact: true }).click();
+  await page.getByRole("option", { name: "image", exact: true }).click();
+  await page.getByRole("listbox").press("Escape");
+  await page.getByRole("button", { name: "Apply filters" }).click();
+  await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get("category") ?? "[]")).toEqual([]);
+});
+
 test("search controls stay in the header while selection actions float without shrinking", async ({
   page,
 }) => {
@@ -552,11 +579,11 @@ test("search selection exposes bounded actions and renames the selected result",
   const row = page.getByRole("row", { name: /alpha\.txt/ });
   await row.click();
   await expect(page.getByText("1 selected", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Cut selected items" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Cut", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Duplicate selected item" })).toHaveCount(0);
-  await page.getByRole("button", { name: "Rename selected item" }).click();
-  await page.getByRole("textbox", { name: "New name" }).fill("renamed.txt");
   await page.getByRole("button", { name: "Rename", exact: true }).click();
+  await page.getByRole("textbox", { name: "New name" }).fill("renamed.txt");
+  await page.getByRole("dialog").getByRole("button", { name: "Rename", exact: true }).click();
   await expect.poll(() => renamed?.id).toBe(fileId);
   expect(renamed?.body).toEqual({ name: "renamed.txt" });
 });
@@ -586,7 +613,7 @@ test("failed copies retain retry context and pending confirmation cannot submit 
     .getByRole("row", { name: /alpha\.txt/ })
     .locator('[data-slot="checkbox-control"]')
     .click();
-  await page.getByRole("button", { name: "Copy selected items", exact: true }).click();
+  await page.getByRole("button", { name: "Copy", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Copy 1 item" });
   const confirm = dialog.getByRole("button", { name: "Copy here" });
   await confirm.click();

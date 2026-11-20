@@ -5073,6 +5073,10 @@ func (s *Server) handleDownloadFileRequest(args [2]string, argsEscaped bool, w h
 					In:   "query",
 				}: params.Download,
 				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
+				{
 					Name: "fileId",
 					In:   "path",
 				}: params.FileId,
@@ -5243,6 +5247,10 @@ func (s *Server) handleDownloadFileLegacyRequest(args [1]string, argsEscaped boo
 					In:   "query",
 				}: params.Download,
 				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
+				{
 					Name: "fileId",
 					In:   "path",
 				}: params.FileId,
@@ -5334,6 +5342,10 @@ func (s *Server) handleDownloadPublicShareRequest(args [2]string, argsEscaped bo
 					Name: "download",
 					In:   "query",
 				}: params.Download,
+				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
 				{
 					Name: "token",
 					In:   "path",
@@ -5430,6 +5442,10 @@ func (s *Server) handleDownloadPublicShareFileRequest(args [3]string, argsEscape
 					Name: "download",
 					In:   "query",
 				}: params.Download,
+				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
 				{
 					Name: "token",
 					In:   "path",
@@ -5531,6 +5547,10 @@ func (s *Server) handleDownloadPublicShareFileLegacyRequest(args [2]string, args
 					In:   "query",
 				}: params.Download,
 				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
+				{
 					Name: "token",
 					In:   "path",
 				}: params.Token,
@@ -5626,6 +5646,10 @@ func (s *Server) handleDownloadPublicShareLegacyRequest(args [1]string, argsEsca
 					Name: "download",
 					In:   "query",
 				}: params.Download,
+				{
+					Name: "d",
+					In:   "query",
+				}: params.D,
 				{
 					Name: "token",
 					In:   "path",
@@ -14920,6 +14944,168 @@ func (s *Server) handleRevokeShareRequest(args [1]string, argsEscaped bool, w ht
 	}
 
 	if err := encodeRevokeShareResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
+// handleRunPeriodicJobRequest handles runPeriodicJob operation.
+//
+// POST /v1/periodic-jobs/{periodicJobId}/run
+func (s *Server) handleRunPeriodicJobRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: RunPeriodicJobOperation,
+			ID:   "runPeriodicJob",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, RunPeriodicJobOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, RunPeriodicJobOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, RunPeriodicJobOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+	params, err := decodeRunPeriodicJobParams(args, argsEscaped, r)
+	if err != nil {
+		err = &ogenerrors.DecodeParamsError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeParams", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	var rawBody []byte
+
+	var response RunPeriodicJobRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    RunPeriodicJobOperation,
+			OperationSummary: "",
+			OperationID:      "runPeriodicJob",
+			Body:             nil,
+			RawBody:          rawBody,
+			Params: middleware.Parameters{
+				{
+					Name: "periodicJobId",
+					In:   "path",
+				}: params.PeriodicJobId,
+			},
+			Raw: r,
+		}
+
+		type (
+			Request  = struct{}
+			Params   = RunPeriodicJobParams
+			Response = RunPeriodicJobRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			unpackRunPeriodicJobParams,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.RunPeriodicJob(ctx, params)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.RunPeriodicJob(ctx, params)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodeRunPeriodicJobResponse(response, w); err != nil {
 		defer recordError("EncodeResponse", err)
 		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
 			s.cfg.ErrorHandler(ctx, w, r, err)
